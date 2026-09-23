@@ -1,0 +1,138 @@
+name: NISAR GUNW Earthaccess Discovery Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  discover-gunw:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Checkout pinned SARGuardian science source
+        uses: actions/checkout@v4
+        with:
+          repository: Sagormodak/SARGuardian
+          ref: 77cc9646cfa46d3aff3669d351912f984cf67aa3
+          path: science-source
+
+      - name: Verify science source revision
+        shell: bash
+        run: |
+          expected="77cc9646cfa46d3aff3669d351912f984cf67aa3"
+          actual="$(git -C science-source rev-parse HEAD)"
+          test "$actual" = "$expected"
+
+      - name: Install Earthaccess and AOI dependencies
+        run: python -m pip install --upgrade earthaccess numpy h5py
+
+      - name: Discover one bounded GUNW collection result
+        env:
+          EARTHDATA_USERNAME: ${{ secrets.EARTHDATA_USERNAME }}
+          EARTHDATA_PASSWORD: ${{ secrets.EARTHDATA_PASSWORD }}
+        run: |
+          SCIENCE_ROOT="$PWD/science-source" python - <<'PY'
+          import os
+          import shutil
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          EXPECTED_COMMIT = "77cc9646cfa46d3aff3669d351912f984cf67aa3"
+          SCIENCE_ROOT = Path(os.environ["SCIENCE_ROOT"])
+          START = "2026-06-17"
+          END = datetime.now(timezone.utc).date().isoformat()
+
+          def safe_name(result):
+              if hasattr(result, "get"):  # earthaccess DataGranule/dict shape
+                  umm = result.get("umm", {})
+                  if isinstance(umm, dict):
+                      name = umm.get("GranuleUR") or umm.get("CollectionReference", {}).get("ShortName")
+                      if name:
+                          return Path(str(name)).name
+                  for key in ("producer_granule_id", "granuleName", "name"):
+                      if result.get(key):
+                          return Path(str(result[key])).name
+              for attr in ("granule_ur", "name"):
+                  value = getattr(result, attr, None)
+                  if value:
+                      return Path(str(value)).name
+              return "unknown"
+
+          def has_access_link(result):
+              try:
+                  links = result.get_data_links()
+                  return bool(links)
+              except Exception:
+                  pass
+              try:
+                  umm = result.get("umm", {})
+                  related = umm.get("RelatedUrls", []) if isinstance(umm, dict) else []
+                  return any(
+                      isinstance(link, dict)
+                      and link.get("URL")
+                      and link.get("Type") in {"GET DATA", "Data", "Download"}
+                      for link in related
+                  )
+              except Exception:
+                  return False
+
+          try:
+              sys.path.insert(0, str(SCIENCE_ROOT / "src"))
+              import earthaccess
+              import gunw_reader
+
+              actual_commit = os.popen(
+                  f'git -C "{SCIENCE_ROOT}" rev-parse HEAD'
+              ).read().strip()
+              if actual_commit != EXPECTED_COMMIT:
+                  raise RuntimeError("science source revision mismatch")
+
+              source_ring = gunw_reader.AOIS["source"]
+              lons = [point[0] for point in source_ring]
+              lats = [point[1] for point in source_ring]
+              bbox = (min(lons), min(lats), max(lons), max(lats))
+
+              print("GUNW_EARTHACCESS_DISCOVERY_START")
+              print(f"SOURCE_AOI_BBOX: {bbox}")
+              print(f"TEMPORAL_START: {START}")
+              print(f"TEMPORAL_END: {END}")
+
+              earthaccess.login(strategy="environment")
+              results = earthaccess.search_data(
+                  short_name="NISAR_L2_GUNW_PROVISIONAL_V1",
+                  temporal=(START, END),
+                  bounding_box=bbox,
+                  count=10,
+              )
+
+              print(f"RESULT_COUNT: {len(results)}")
+              usable = []
+              for result in results:
+                  name = safe_name(result)
+                  access_link = has_access_link(result)
+                  print(f"GUNW_PRODUCT: {name}")
+                  print(f"HAS_DATA_ACCESS_LINK: {access_link}")
+                  if access_link:
+                      usable.append(name)
+
+              if not results:
+                  print("NISAR_GUNW_EARTHACCESS_NO_RESULTS")
+                  sys.exit(1)
+              if not usable:
+                  raise RuntimeError("no returned GUNW result has a data access link")
+
+              print(f"SELECTED_GUNW_PRODUCT: {usable[0]}")
+              print("NISAR_GUNW_EARTHACCESS_DISCOVERY_SUCCESS")
+          except Exception as exc:
+              print("NISAR_GUNW_EARTHACCESS_DISCOVERY_FAILED")
+              print(f"SAFE_ERROR: {type(exc).__name__}: discovery failed")
+              sys.exit(1)
+          finally:
+              usage = shutil.disk_usage("/")
+              print(f"FINAL_DISK_AVAILABLE_BYTES: {usage.free}")
+          PY
