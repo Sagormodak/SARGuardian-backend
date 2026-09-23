@@ -46,6 +46,7 @@ jobs:
           import sys
           import tempfile
           import threading
+          import time
           from datetime import datetime, timezone
           from pathlib import Path
           from time import monotonic
@@ -108,11 +109,22 @@ jobs:
               phase = "discovery"
               try:
                   acquisition.set_aoi("source")
-                  rows = acquisition.asf_query(
-                      warn_on_cap=False,
-                      platform="NISAR",
-                      processingLevel="GUNW",
-                  )
+                  discovery_end = datetime.now(timezone.utc).date().isoformat()
+                  rows = None
+                  for attempt in range(3):
+                      try:
+                          rows = acquisition.query_by_year(
+                              "2026-06-17",
+                              discovery_end,
+                              platform="NISAR",
+                              processingLevel="GUNW",
+                              maxResults=25,
+                          )
+                          break
+                      except Exception:
+                          if attempt == 2:
+                              raise
+                          time.sleep(5 * (2 ** attempt))
                   candidates = sorted(
                       (
                           row for row in rows
