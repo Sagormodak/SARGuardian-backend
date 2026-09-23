@@ -1,0 +1,37 @@
+name: Runner Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect-runner:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Show runner information
+        run: |
+          echo "=== OS ==="
+          uname -a
+
+          echo "=== CPU ==="
+          nproc
+          lscpu | grep -E '^CPU\(s\):|^Model name:'
+
+          echo "=== RAM ==="
+          free -h
+
+          echo "=== DISK ==="
+          df -h /
+
+          echo "=== RUNNER ==="
+          echo "OS: $RUNNER_OS"
+          echo "ARCH: $RUNNER_ARCH"
+          echo "NAME: $RUNNER_NAME"
+          echo "TEMP: $RUNNER_TEMP"
+          echo "WORKSPACE: $GITHUB_WORKSPACE"
+
+          echo "=== PYTHON ==="
+          python --version
+
+          echo "=== GIT ==="
+          git --version
