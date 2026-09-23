@@ -99,12 +99,6 @@ jobs:
                       return Path(str(value)).name
               return "unknown"
 
-          def has_access_link(result):
-              try:
-                  return bool(result.get_data_links())
-              except Exception:
-                  return False
-
           def peak_rss_worker(stop_event, peak):
               while not stop_event.is_set():
                   current = rss_bytes()
@@ -142,15 +136,9 @@ jobs:
                       bounding_box=bbox,
                       count=10,
                   )
-                  candidates = [
-                      result for result in results
-                      if has_access_link(result)
-                  ]
                   if not results:
                       raise RuntimeError("no GUNW results")
-                  if not candidates:
-                      raise RuntimeError("no GUNW result has a data access link")
-                  selected = candidates[0]
+                  selected = results[0]
                   product_name = safe_name(selected)
                   print(f"SELECTED_GUNW_PRODUCT: {product_name}")
               except Exception:
