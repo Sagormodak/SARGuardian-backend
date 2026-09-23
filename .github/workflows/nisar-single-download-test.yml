@@ -1,0 +1,116 @@
+name: NISAR Single Download Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  download-test:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install latest earthaccess
+        run: python -m pip install --upgrade earthaccess
+
+      - name: Download one NISAR GCOV granule
+        env:
+          EARTHDATA_USERNAME: ${{ secrets.EARTHDATA_USERNAME }}
+          EARTHDATA_PASSWORD: ${{ secrets.EARTHDATA_PASSWORD }}
+        run: |
+          python - <<'PY'
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from time import monotonic
+
+          def print_free_space():
+              subprocess.run(["df", "-h"], check=False)
+
+          def safe_granule_name(granule):
+              umm = granule.get("umm", {})
+              granule_ur = umm.get("GranuleUR") if isinstance(umm, dict) else None
+              if not granule_ur:
+                  return "unknown"
+              name = str(granule_ur).split("?", 1)[0].split("#", 1)[0]
+              return Path(name.rstrip("/")).name or "unknown"
+
+          temp_dir = None
+          downloaded_path = None
+          try:
+              import earthaccess
+
+              auth = earthaccess.login(strategy="environment")
+              results = earthaccess.search_data(
+                  short_name="NISAR_L2_GCOV_PROVISIONAL_V1",
+                  count=1,
+                  downloadable=True,
+              )
+
+              if not results:
+                  print("NISAR_DOWNLOAD_NO_RESULTS")
+                  sys.exit(1)
+
+              selected_granule = results[0]
+              temp_dir = Path(tempfile.mkdtemp(prefix="nisar-download-test-"))
+              print("NISAR_DOWNLOAD_TEST_START")
+              print(datetime.now(timezone.utc).isoformat())
+              print_free_space()
+              print(f"Selected granule: {safe_granule_name(selected_granule)}")
+
+              download_started_at = datetime.now(timezone.utc)
+              download_start = monotonic()
+              downloaded_paths = earthaccess.download(
+                  [selected_granule],
+                  local_path=temp_dir,
+                  threads=1,
+              )
+              elapsed_seconds = monotonic() - download_start
+              download_finished_at = datetime.now(timezone.utc)
+
+              if len(downloaded_paths) != 1:
+                  raise RuntimeError("unexpected download count")
+
+              downloaded_path = Path(downloaded_paths[0])
+              if not downloaded_path.is_file():
+                  raise RuntimeError("downloaded file was not found")
+
+              file_size_bytes = downloaded_path.stat().st_size
+              file_size_gib = file_size_bytes / (1024 ** 3)
+              print("NISAR_DOWNLOAD_SUCCESS")
+              print(f"Download start UTC: {download_started_at.isoformat()}")
+              print(f"Download end UTC: {download_finished_at.isoformat()}")
+              print(f"Downloaded file path: {downloaded_path}")
+              print(f"File size bytes: {file_size_bytes}")
+              print(f"File size GiB: {file_size_gib:.6f}")
+              print(f"Elapsed seconds: {elapsed_seconds:.3f}")
+              print_free_space()
+          except SystemExit:
+              raise
+          except Exception:
+              print("NISAR_DOWNLOAD_FAILED")
+              print("Download test failed safely.")
+              sys.exit(1)
+          finally:
+              if temp_dir is not None:
+                  try:
+                      shutil.rmtree(temp_dir)
+                  except Exception:
+                      print("NISAR_DOWNLOAD_FAILED")
+                      print("Cleanup failed safely.")
+                      sys.exit(1)
+
+                  if downloaded_path is not None and downloaded_path.exists():
+                      print("NISAR_DOWNLOAD_FAILED")
+                      print("Cleanup verification failed safely.")
+                      sys.exit(1)
+
+                  print_free_space()
+                  print("NISAR_DOWNLOAD_CLEANUP_SUCCESS")
+          PY
