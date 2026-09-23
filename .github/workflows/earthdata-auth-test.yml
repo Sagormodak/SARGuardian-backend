@@ -1,0 +1,36 @@
+name: Earthdata Authentication Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  authenticate:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install latest earthaccess
+        run: python -m pip install --upgrade earthaccess
+
+      - name: Authenticate with Earthdata
+        env:
+          EARTHDATA_USERNAME: ${{ secrets.EARTHDATA_USERNAME }}
+          EARTHDATA_PASSWORD: ${{ secrets.EARTHDATA_PASSWORD }}
+        run: |
+          python - <<'PY'
+          import sys
+
+          import earthaccess
+
+          try:
+              auth = earthaccess.login(strategy="environment")
+          except Exception:
+              print("EARTHDATA_AUTH_FAILED")
+              sys.exit(1)
+
+          print("EARTHDATA_AUTH_SUCCESS")
+          PY
