@@ -1,0 +1,285 @@
+name: NISAR GUNW Earthaccess Read Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  read-gunw:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Checkout pinned SARGuardian science source
+        uses: actions/checkout@v4
+        with:
+          repository: Sagormodak/SARGuardian
+          ref: 77cc9646cfa46d3aff3669d351912f984cf67aa3
+          path: science-source
+
+      - name: Verify science source revision
+        shell: bash
+        run: |
+          expected="77cc9646cfa46d3aff3669d351912f984cf67aa3"
+          actual="$(git -C science-source rev-parse HEAD)"
+          test "$actual" = "$expected"
+
+      - name: Install pinned science requirements and Earthaccess
+        run: |
+          python -m pip install --requirement science-source/requirements.txt
+          python -m pip install --upgrade earthaccess
+
+      - name: Discover, download, and read one GUNW
+        env:
+          EARTHDATA_USERNAME: ${{ secrets.EARTHDATA_USERNAME }}
+          EARTHDATA_PASSWORD: ${{ secrets.EARTHDATA_PASSWORD }}
+        run: |
+          SCIENCE_ROOT="$PWD/science-source" python - <<'PY'
+          import contextlib
+          import gc
+          import io
+          import json
+          import os
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          import threading
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from time import monotonic
+
+          EXPECTED_COMMIT = "77cc9646cfa46d3aff3669d351912f984cf67aa3"
+          SCIENCE_REPOSITORY = "Sagormodak/SARGuardian"
+          COLLECTION = "NISAR_L2_GUNW_PROVISIONAL_V1"
+          START = "2026-06-17"
+          LOW_DISK_BYTES = 2 * 1024 ** 3
+          SCIENCE_ROOT = Path(os.environ["SCIENCE_ROOT"])
+          END = datetime.now(timezone.utc).date().isoformat()
+          raw_dir = Path(tempfile.mkdtemp(prefix="nisar-gunw-earthaccess-"))
+          raw_path = None
+          summary_path = Path(tempfile.gettempdir()) / "nisar-gunw-earthaccess-read-summary.json"
+          exit_code = 0
+          failure_marker = None
+          cleanup_succeeded = False
+          test_started_at = datetime.now(timezone.utc)
+          test_start = monotonic()
+
+          def disk_snapshot(label):
+              usage = shutil.disk_usage("/")
+              print(f"DISK_{label}_AVAILABLE_BYTES: {usage.free}")
+              subprocess.run(["df", "-h", "/"], check=False)
+              return usage
+
+          def rss_bytes():
+              try:
+                  for line in Path("/proc/self/status").read_text().splitlines():
+                      if line.startswith("VmRSS:"):
+                          return int(line.split()[1]) * 1024
+              except (OSError, ValueError, IndexError):
+                  pass
+              return None
+
+          def safe_name(result):
+              if hasattr(result, "get"):
+                  umm = result.get("umm", {})
+                  if isinstance(umm, dict):
+                      name = umm.get("GranuleUR")
+                      if name:
+                          return Path(str(name)).name
+                  for key in ("producer_granule_id", "granuleName", "name"):
+                      if result.get(key):
+                          return Path(str(result[key])).name
+              for attr in ("granule_ur", "name"):
+                  value = getattr(result, attr, None)
+                  if value:
+                      return Path(str(value)).name
+              return "unknown"
+
+          def has_access_link(result):
+              try:
+                  return bool(result.get_data_links())
+              except Exception:
+                  return False
+
+          def peak_rss_worker(stop_event, peak):
+              while not stop_event.is_set():
+                  current = rss_bytes()
+                  if current is not None:
+                      peak[0] = max(peak[0], current)
+                  stop_event.wait(0.05)
+
+          try:
+              sys.path.insert(0, str(SCIENCE_ROOT / "src"))
+              import earthaccess
+              import gunw_reader
+              from gunw_reader import read_gunw, report, set_aoi
+
+              actual_commit = subprocess.check_output(
+                  ["git", "-C", str(SCIENCE_ROOT), "rev-parse", "HEAD"],
+                  text=True,
+              ).strip()
+              if actual_commit != EXPECTED_COMMIT:
+                  raise RuntimeError("science source revision mismatch")
+
+              source_ring = gunw_reader.AOIS["source"]
+              lons = [point[0] for point in source_ring]
+              lats = [point[1] for point in source_ring]
+              bbox = (min(lons), min(lats), max(lons), max(lats))
+              print("GUNW_EARTHACCESS_READ_START")
+              print(f"SOURCE_AOI_BBOX: {bbox}")
+              print(f"TEMPORAL_START: {START}")
+              print(f"TEMPORAL_END: {END}")
+
+              try:
+                  earthaccess.login(strategy="environment")
+                  results = earthaccess.search_data(
+                      short_name=COLLECTION,
+                      temporal=(START, END),
+                      bounding_box=bbox,
+                      count=10,
+                  )
+                  candidates = [
+                      result for result in results
+                      if has_access_link(result)
+                  ]
+                  if not results:
+                      raise RuntimeError("no GUNW results")
+                  if not candidates:
+                      raise RuntimeError("no GUNW result has a data access link")
+                  selected = candidates[0]
+                  product_name = safe_name(selected)
+                  print(f"SELECTED_GUNW_PRODUCT: {product_name}")
+              except Exception:
+                  failure_marker = "NISAR_GUNW_EARTHACCESS_DISCOVERY_FAILED"
+                  raise
+
+              before_download = disk_snapshot("BEFORE_DOWNLOAD")
+              if before_download.free < LOW_DISK_BYTES:
+                  failure_marker = "NISAR_GUNW_EARTHACCESS_LOW_DISK"
+                  raise RuntimeError("insufficient disk space before download")
+              download_started_at = datetime.now(timezone.utc).isoformat()
+              download_start = monotonic()
+              try:
+                  with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                      earthaccess.download([selected], local_path=raw_dir)
+                  downloaded_files = sorted(raw_dir.rglob("*.h5"))
+                  if len(downloaded_files) != 1:
+                      raise RuntimeError("download did not produce exactly one HDF5 file")
+                  raw_path = downloaded_files[0]
+              except Exception:
+                  if shutil.disk_usage("/").free < LOW_DISK_BYTES:
+                      failure_marker = "NISAR_GUNW_EARTHACCESS_LOW_DISK"
+                  else:
+                      failure_marker = "NISAR_GUNW_EARTHACCESS_DOWNLOAD_FAILED"
+                  raise
+              download_finished_at = datetime.now(timezone.utc).isoformat()
+              download_elapsed = monotonic() - download_start
+              after_download = disk_snapshot("AFTER_DOWNLOAD")
+              if after_download.free < LOW_DISK_BYTES:
+                  failure_marker = "NISAR_GUNW_EARTHACCESS_LOW_DISK"
+                  raise RuntimeError("insufficient disk space after download")
+              downloaded_size = raw_path.stat().st_size
+              print(f"GUNW_FILE_SIZE_BYTES: {downloaded_size}")
+              print(f"GUNW_DOWNLOAD_START_UTC: {download_started_at}")
+              print(f"GUNW_DOWNLOAD_END_UTC: {download_finished_at}")
+              print(f"GUNW_DOWNLOAD_ELAPSED_SECONDS: {download_elapsed:.3f}")
+
+              try:
+                  set_aoi("source")
+                  science_started_at = datetime.now(timezone.utc).isoformat()
+                  science_start = monotonic()
+                  rss_before = rss_bytes()
+                  peak = [rss_before or 0]
+                  monitor_stop = threading.Event()
+                  monitor = threading.Thread(
+                      target=peak_rss_worker,
+                      args=(monitor_stop, peak),
+                      daemon=True,
+                  )
+                  monitor.start()
+                  try:
+                      result = read_gunw(raw_path, clip_aoi=True, auto_ref=True)
+                      valid_pixels = int(result["valid"].sum())
+                      if valid_pixels < 1:
+                          raise RuntimeError("no valid pixels extracted")
+                      report_output = io.StringIO()
+                      with contextlib.redirect_stdout(report_output):
+                          report_result = report(result)
+                  finally:
+                      monitor_stop.set()
+                      monitor.join(timeout=2)
+                  rss_after = rss_bytes()
+                  science_finished_at = datetime.now(timezone.utc).isoformat()
+                  science_elapsed = monotonic() - science_start
+              except Exception:
+                  failure_marker = "NISAR_GUNW_EARTHACCESS_SCIENCE_FAILED"
+                  raise
+
+              summary = {
+                  "test_type": "real Earthaccess GUNW reader feasibility",
+                  "science_repository": SCIENCE_REPOSITORY,
+                  "science_commit": EXPECTED_COMMIT,
+                  "discovery_collection": COLLECTION,
+                  "product_type": "GUNW",
+                  "selected_product_identifier": product_name,
+                  "file_size_bytes": downloaded_size,
+                  "valid_pixel_count": valid_pixels,
+                  "report_result": report_result,
+                  "report_output": report_output.getvalue(),
+                  "test_started_utc": test_started_at.isoformat(),
+                  "download_started_utc": download_started_at,
+                  "download_finished_utc": download_finished_at,
+                  "science_started_utc": science_started_at,
+                  "science_finished_utc": science_finished_at,
+                  "download_elapsed_seconds": round(download_elapsed, 3),
+                  "science_elapsed_seconds": round(science_elapsed, 3),
+                  "rss_before_science_bytes": rss_before,
+                  "rss_after_science_bytes": rss_after,
+                  "peak_science_rss_observed_bytes": peak[0],
+                  "disk_before_download_available_bytes": before_download.free,
+                  "disk_after_download_available_bytes": after_download.free,
+              }
+              summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+              print(f"COMPACT_OUTPUT_PATH: {summary_path}")
+              print(f"SCIENCE_RSS_BEFORE_BYTES: {rss_before}")
+              print(f"SCIENCE_RSS_AFTER_BYTES: {rss_after}")
+              print(f"SCIENCE_PEAK_RSS_OBSERVED_BYTES: {peak[0]}")
+              del report_result, result
+              gc.collect()
+          except Exception as exc:
+              if failure_marker is None:
+                  failure_marker = "NISAR_GUNW_EARTHACCESS_SCIENCE_FAILED"
+              print(failure_marker)
+              print(f"SAFE_ERROR: {type(exc).__name__}: operation failed")
+              exit_code = 1
+          finally:
+              try:
+                  if raw_path is not None and raw_path.exists():
+                      raw_path.unlink()
+                  if raw_dir.exists():
+                      shutil.rmtree(raw_dir)
+                  if raw_path is not None and raw_path.exists():
+                      raise RuntimeError("raw file remains")
+                  if raw_dir.exists():
+                      raise RuntimeError("raw directory remains")
+                  cleanup_succeeded = True
+              except Exception:
+                  print("NISAR_GUNW_EARTHACCESS_RAW_CLEANUP_FAILED")
+                  exit_code = 1
+
+              final_disk = disk_snapshot("AFTER_RAW_CLEANUP")
+              if cleanup_succeeded:
+                  print("NISAR_GUNW_RAW_CLEANUP_SUCCESS")
+                  if failure_marker is None:
+                      print("NISAR_GUNW_EARTHACCESS_SCIENCE_SUCCESS")
+                      print(f"FINAL_DISK_AVAILABLE_BYTES: {final_disk.free}")
+                      print(f"TEST_ELAPSED_SECONDS: {monotonic() - test_start:.3f}")
+              else:
+                  print("NISAR_GUNW_EARTHACCESS_RAW_CLEANUP_FAILED")
+
+          sys.exit(exit_code)
+          PY
