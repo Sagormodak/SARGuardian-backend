@@ -1,0 +1,198 @@
+name: NISAR Multi-Granule Storage Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  storage-test:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install latest earthaccess
+        run: python -m pip install --upgrade earthaccess
+
+      - name: Download NISAR granules for storage test
+        env:
+          EARTHDATA_USERNAME: ${{ secrets.EARTHDATA_USERNAME }}
+          EARTHDATA_PASSWORD: ${{ secrets.EARTHDATA_PASSWORD }}
+        run: |
+          python - <<'PY'
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from time import monotonic
+
+          TARGET_BYTES = 15 * 1024 ** 3
+          LOW_DISK_BYTES = 2 * 1024 ** 3
+          MAX_GRANULES = 8
+
+          class StopTest(Exception):
+              pass
+
+          def filesystem_snapshot():
+              usage = shutil.disk_usage("/")
+              subprocess.run(["df", "-h", "/"], check=False)
+              print(f"AVAILABLE_DISK_BYTES: {usage.free}")
+              return usage.free, usage.total - usage.free
+
+          def safe_granule_name(granule):
+              umm = granule.get("umm", {})
+              granule_ur = umm.get("GranuleUR") if isinstance(umm, dict) else None
+              if not granule_ur:
+                  return "unknown"
+              name = str(granule_ur).split("?", 1)[0].split("#", 1)[0]
+              return Path(name.rstrip("/")).name or "unknown"
+
+          def files_in(directory):
+              return {
+                  path: path.stat().st_size
+                  for path in directory.rglob("*")
+                  if path.is_file()
+              }
+
+          test_started_at = datetime.now(timezone.utc)
+          test_start = monotonic()
+          temp_dir = None
+          total_downloaded_bytes = 0
+          downloaded_granules = 0
+          peak_used_bytes = 0
+          exit_code = 0
+
+          print("NISAR_MULTI_GRANULE_TEST_START")
+          print(f"Test start UTC: {test_started_at.isoformat()}")
+
+          try:
+              import earthaccess
+
+              temp_dir = Path(tempfile.mkdtemp(prefix="nisar-multi-granule-"))
+              auth = earthaccess.login(strategy="environment")
+              results = earthaccess.search_data(
+                  short_name="NISAR_L2_GCOV_PROVISIONAL_V1",
+                  downloadable=True,
+                  count=MAX_GRANULES,
+              )
+              granules = list(results[:MAX_GRANULES])
+
+              if not granules:
+                  print("NISAR_MULTI_GRANULE_TARGET_NOT_REACHED")
+                  raise StopTest
+
+              available_bytes, used_bytes = filesystem_snapshot()
+              peak_used_bytes = max(peak_used_bytes, used_bytes)
+
+              for granule_number, granule in enumerate(granules, start=1):
+                  if total_downloaded_bytes >= TARGET_BYTES:
+                      break
+
+                  available_bytes, used_bytes = filesystem_snapshot()
+                  peak_used_bytes = max(peak_used_bytes, used_bytes)
+                  if available_bytes < LOW_DISK_BYTES:
+                      print("NISAR_MULTI_GRANULE_LOW_DISK")
+                      raise StopTest
+
+                  before_files = files_in(temp_dir)
+                  download_started_at = monotonic()
+                  downloaded_paths = earthaccess.download(
+                      [granule],
+                      local_path=temp_dir,
+                      threads=1,
+                  )
+                  elapsed_seconds = monotonic() - download_started_at
+
+                  after_files = files_in(temp_dir)
+                  new_files = {
+                      path: size
+                      for path, size in after_files.items()
+                      if path not in before_files
+                  }
+                  returned_files = [
+                      Path(path)
+                      for path in downloaded_paths
+                      if Path(path).is_file()
+                  ]
+                  downloaded_files = returned_files or list(new_files)
+                  if len(downloaded_files) != 1:
+                      raise RuntimeError("unexpected downloaded file count")
+
+                  downloaded_file = downloaded_files[0]
+                  file_size_bytes = downloaded_file.stat().st_size
+                  total_downloaded_bytes += file_size_bytes
+                  downloaded_granules += 1
+
+                  available_bytes, used_bytes = filesystem_snapshot()
+                  peak_used_bytes = max(peak_used_bytes, used_bytes)
+                  print(f"Granule number: {granule_number}")
+                  print(f"Safe granule name: {safe_granule_name(granule)}")
+                  print(f"File size bytes: {file_size_bytes}")
+                  print(f"File size GiB: {file_size_bytes / (1024 ** 3):.6f}")
+                  print(
+                      "Cumulative size GiB: "
+                      f"{total_downloaded_bytes / (1024 ** 3):.6f}"
+                  )
+                  print(f"Download elapsed seconds: {elapsed_seconds:.3f}")
+
+                  if total_downloaded_bytes >= TARGET_BYTES:
+                      break
+
+                  if available_bytes < LOW_DISK_BYTES:
+                      print("NISAR_MULTI_GRANULE_LOW_DISK")
+                      raise StopTest
+
+              if total_downloaded_bytes < TARGET_BYTES:
+                  print("NISAR_MULTI_GRANULE_TARGET_NOT_REACHED")
+                  raise StopTest
+
+              print("NISAR_MULTI_GRANULE_STORAGE_SUCCESS")
+              print(f"TOTAL_DOWNLOADED_BYTES: {total_downloaded_bytes}")
+              print(
+                  "TOTAL_DOWNLOADED_GIB: "
+                  f"{total_downloaded_bytes / (1024 ** 3):.6f}"
+              )
+              print(f"NUMBER_OF_GRANULES: {downloaded_granules}")
+              print(f"PEAK_DISK_USED_BYTES: {peak_used_bytes}")
+
+              present_files = files_in(temp_dir)
+              present_total_bytes = sum(present_files.values())
+              tolerance_bytes = max(1024 ** 2, total_downloaded_bytes // 1000)
+              if abs(present_total_bytes - total_downloaded_bytes) > tolerance_bytes:
+                  raise RuntimeError("keep-all verification mismatch")
+              print("NISAR_MULTI_GRANULE_KEEP_ALL_VERIFIED")
+          except StopTest:
+              exit_code = 1
+          except Exception:
+              if shutil.disk_usage("/").free < LOW_DISK_BYTES:
+                  print("NISAR_MULTI_GRANULE_LOW_DISK")
+              else:
+                  print("NISAR_MULTI_GRANULE_FAILED")
+                  print("Storage test failed safely.")
+              exit_code = 1
+          finally:
+              if temp_dir is not None:
+                  try:
+                      shutil.rmtree(temp_dir)
+                      if temp_dir.exists():
+                          raise RuntimeError("temporary directory remains")
+                  except Exception:
+                      print("NISAR_MULTI_GRANULE_FAILED")
+                      print("Cleanup failed safely.")
+                      exit_code = 1
+                  else:
+                      final_available_bytes, final_used_bytes = filesystem_snapshot()
+                      print(f"FINAL_AVAILABLE_DISK: {final_available_bytes}")
+                      print("NISAR_MULTI_GRANULE_CLEANUP_SUCCESS")
+
+              test_finished_at = datetime.now(timezone.utc)
+              total_elapsed_seconds = monotonic() - test_start
+              print(f"Test end UTC: {test_finished_at.isoformat()}")
+              print(f"Total elapsed seconds: {total_elapsed_seconds:.3f}")
+
+          sys.exit(exit_code)
+          PY
