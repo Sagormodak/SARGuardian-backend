@@ -128,6 +128,12 @@ def drive_url(query):
 
 
 def create_run_folder(access_token, parent_folder_id, run_id):
+    parent = drive_request(
+        access_token,
+        f"{DRIVE_API_URL}/{parent_folder_id}?{urlencode({'fields': 'id,mimeType'})}",
+    )
+    if parent.get("mimeType") != "application/vnd.google-apps.folder":
+        raise DriveUploadError("DRIVE_PARENT_FOLDER_INVALID")
     metadata = json.dumps({
         "name": run_id,
         "mimeType": "application/vnd.google-apps.folder",
@@ -227,6 +233,17 @@ def result_files(result_directory):
     return files
 
 
+def verify_result_manifest(result_directory):
+    try:
+        manifest = json.loads(
+            (result_directory / "manifest.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        raise DriveUploadError("DRIVE_RESULT_PACKAGE_INVALID") from None
+    if not isinstance(manifest, dict) or not manifest.get("raw_cleanup_success"):
+        raise DriveUploadError("DRIVE_RAW_CLEANUP_NOT_CONFIRMED")
+
+
 def main():
     try:
         client_id, client_secret = parse_client_configuration(
@@ -237,7 +254,9 @@ def main():
         )
         parent_folder_id = required_environment("GOOGLE_DRIVE_PARENT_FOLDER_ID")
         run_id = required_environment("GITHUB_RUN_ID")
-        files = result_files(Path("result"))
+        result_directory = Path("result")
+        files = result_files(result_directory)
+        verify_result_manifest(result_directory)
 
         print("DRIVE_UPLOAD_STARTED")
         print("DRIVE_RAW_H5_COUNT: 0")
