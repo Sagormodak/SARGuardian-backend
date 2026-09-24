@@ -576,27 +576,27 @@ jobs:
           print("NISAR_GOFF_TIMESERIES_SUCCESS")
           PY
 
-            - name: Create persistent GOFF result package
-                if: success()
-                shell: bash
-                run: |
-                    cp result/result.json result/manifest.json
-                    cat > result/README.txt <<'EOF'
-                    SARGuardian GOFF candidate-4 time-series feasibility result
+      - name: Create persistent GOFF result package
+        if: success()
+        shell: bash
+        run: |
+          cp result/result.json result/manifest.json
+          cat > result/README.txt <<'EOF'
+          SARGuardian GOFF candidate-4 time-series feasibility result
 
-                    This package records a software execution feasibility test, not scientific event evidence.
-                    Science commit: 77cc9646cfa46d3aff3669d351912f984cf67aa3
-                    Workflow: sequential Earthaccess GOFF downloads, pinned read_goff layer2 processing, source-AOI fixed-lattice common reference, candidate-4 target-window measurement, and existing time-series inversion.
-                    result.json contains the compact run summary.
-                    timeseries.csv contains cumulative time-series rows.
-                    manifest.json records provenance, selections, measurements, inversions, timings, and cleanup status.
-                    Raw NISAR HDF5 products are deleted immediately after derived processing and are not included in this package.
-                    EOF
+          This package records a software execution feasibility test, not scientific event evidence.
+          Science commit: 77cc9646cfa46d3aff3669d351912f984cf67aa3
+          Workflow: sequential Earthaccess GOFF downloads, pinned read_goff layer2 processing, source-AOI fixed-lattice common reference, candidate-4 target-window measurement, and existing time-series inversion.
+          result.json contains the compact run summary.
+          timeseries.csv contains cumulative time-series rows.
+          manifest.json records provenance, selections, measurements, inversions, timings, and cleanup status.
+          Raw NISAR HDF5 products are deleted immediately after derived processing and are not included in this package.
+          EOF
 
-            - name: Upload GOFF feasibility result package
-                if: success()
-                uses: actions/upload-artifact@v4
-                with:
-                    name: nisar-goff-candidate4-result-${{ github.run_id }}
-                    path: result/
-                    if-no-files-found: error
+      - name: Upload GOFF feasibility result package
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nisar-goff-candidate4-result-${{ github.run_id }}
+          path: result/
+          if-no-files-found: error
