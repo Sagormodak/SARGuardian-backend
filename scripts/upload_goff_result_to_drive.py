@@ -81,12 +81,15 @@ def parse_refresh_token(raw_secret):
     return token.strip()
 
 
-def request_json(request):
-    try:
-        with urlopen(request, timeout=60) as response:
-            response_body = response.read()
-    except (HTTPError, URLError, OSError, TimeoutError):
-        raise DriveUploadError("DRIVE_API_REQUEST_FAILED") from None
+def request_json(request, retries=0):
+    for attempt in range(retries + 1):
+        try:
+            with urlopen(request, timeout=60) as response:
+                response_body = response.read()
+            break
+        except (HTTPError, URLError, OSError, TimeoutError):
+            if attempt == retries:
+                raise DriveUploadError("DRIVE_API_REQUEST_FAILED") from None
 
     try:
         response_document = json.loads(response_body)
@@ -109,7 +112,7 @@ def refresh_access_token(client_id, client_secret, refresh_token):
         data=payload,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
-    ))
+    ), retries=2)
     access_token = response.get("access_token")
     if not isinstance(access_token, str) or not access_token:
         raise DriveUploadError("DRIVE_AUTHENTICATION_FAILED")
@@ -120,7 +123,10 @@ def drive_request(access_token, url, method="GET", data=None, content_type=None)
     headers = {"Authorization": f"Bearer {access_token}"}
     if content_type is not None:
         headers["Content-Type"] = content_type
-    return request_json(Request(url, data=data, headers=headers, method=method))
+    return request_json(
+        Request(url, data=data, headers=headers, method=method),
+        retries=2 if method == "GET" else 0,
+    )
 
 
 def drive_url(query):
