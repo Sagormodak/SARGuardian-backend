@@ -239,7 +239,7 @@ jobs:
                       short_name=COLLECTION,
                       temporal=(START, END),
                       bounding_box=bbox,
-                      count=25,
+                      count=100,
                   )
                   chain = choose_network(results)
                   if chain is None:
