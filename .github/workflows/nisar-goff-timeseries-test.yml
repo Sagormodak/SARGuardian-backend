@@ -289,9 +289,19 @@ jobs:
                       fail("NISAR_GOFF_TIMESERIES_LOW_DISK")
                   download_started = datetime.now(timezone.utc)
                   download_start = monotonic()
-                  try:
-                      earthaccess.download([item["result"]], local_path=raw_dir)
-                  except Exception:
+                  download_succeeded = False
+                  for _attempt in range(3):
+                      try:
+                          earthaccess.download(
+                              [item["result"]], local_path=raw_dir
+                          )
+                          download_succeeded = True
+                          break
+                      except Exception:
+                          for partial_path in raw_dir.rglob("*"):
+                              if partial_path.is_file():
+                                  partial_path.unlink()
+                  if not download_succeeded:
                       if shutil.disk_usage("/").free < LOW_DISK_BYTES:
                           fail("NISAR_GOFF_TIMESERIES_LOW_DISK")
                       fail("NISAR_GOFF_TIMESERIES_DOWNLOAD_FAILED")
