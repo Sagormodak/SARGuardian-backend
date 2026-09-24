@@ -13,6 +13,9 @@ jobs:
         with:
           python-version: "3.x"
 
+      - name: Checkout SARGuardian backend
+        uses: actions/checkout@v4
+
       - name: Checkout pinned SARGuardian science source
         uses: actions/checkout@v4
         with:
