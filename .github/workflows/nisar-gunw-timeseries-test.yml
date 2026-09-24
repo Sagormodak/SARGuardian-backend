@@ -210,9 +210,12 @@ jobs:
               sys.path.insert(0, str(SCIENCE_ROOT / "src"))
               import earthaccess
               import gunw_reader
-              from gunw_reader import aoi_grid, place_on_grid, read_gunw, set_aoi
+              from common_ref import rereference
+              from gunw_reader import (
+                  aoi_grid, build_aoi_mask, place_on_grid, read_gunw, set_aoi,
+              )
               from timeseries import (
-                  Pair, apply_common_datum, connected_components,
+                  Pair, connected_components,
                   invert_component, report_series,
               )
 
@@ -224,7 +227,7 @@ jobs:
                   raise RuntimeError("science source revision mismatch")
 
               set_aoi("source")
-              source_ring = gunw_reader.AOIS["source"]
+              source_ring = list(gunw_reader.AOIS["source"])
               lons = [point[0] for point in source_ring]
               lats = [point[1] for point in source_ring]
               bbox = (min(lons), min(lats), max(lons), max(lats))
@@ -257,6 +260,9 @@ jobs:
               except Exception:
                   fail("NISAR_GUNW_TIMESERIES_DISCOVERY_FAILED")
 
+              set_aoi("langtang")
+              print("GUNW_REFERENCE_DOMAIN: LANGTANG")
+              print("GUNW_MEASUREMENT_DOMAIN: SOURCE")
               pairs = [
                   Pair(
                       path=item["path"], direction=item["direction"],
@@ -268,8 +274,10 @@ jobs:
               ]
               lattices = {}
               expected_grid_signature = None
+              source_measurement_mask = None
 
-              for item, pair in zip(chain, pairs):
+              for download_index, (item, pair) in enumerate(zip(chain, pairs), 1):
+                  print(f"GUNW_DOWNLOAD_PROGRESS: {download_index}/3")
                   disk_before = disk_snapshot("BEFORE_DOWNLOAD")
                   if disk_before < LOW_DISK_BYTES:
                       fail("NISAR_GUNW_TIMESERIES_LOW_DISK")
@@ -360,15 +368,34 @@ jobs:
                       elif signature != expected_grid_signature:
                           fail("NISAR_GUNW_TIMESERIES_READ_FAILED")
                       valid = result["valid"]
+                      source_product_mask = build_aoi_mask(
+                          result["xs"], result["ys"], source_ring, result["epsg"]
+                      )
+                      if source_product_mask is None:
+                          fail("NISAR_GUNW_TIMESERIES_READ_FAILED")
                       lattice = place_on_grid(
                           __import__("numpy").where(
                               valid, result["displacement_mm"], __import__("numpy").nan
                           ),
                           grid,
                       )
+                      source_lattice = place_on_grid(
+                          np.where(source_product_mask, 1.0, np.nan), grid
+                      )
+                      current_source_mask = np.isfinite(source_lattice)
+                      if source_measurement_mask is None:
+                          source_measurement_mask = current_source_mask
+                      elif not np.array_equal(
+                          source_measurement_mask, current_source_mask
+                      ):
+                          fail("NISAR_GUNW_TIMESERIES_READ_FAILED")
                       print(
                           "GUNW_DIAGNOSTIC_LATTICE_FINITE_PIXELS: "
                           f"{int(np.isfinite(lattice).sum())}"
+                      )
+                      print(
+                          "GUNW_DIAGNOSTIC_SOURCE_FINITE_PIXELS: "
+                          f"{int((np.isfinite(lattice) & current_source_mask).sum())}"
                       )
                       pair.n_px = int(valid.sum())
                       coherence = result.get("coherence")
@@ -410,6 +437,9 @@ jobs:
                       "disk_after_download_available_bytes": disk_after_download,
                       "disk_after_raw_delete_available_bytes": disk_after_delete,
                       "valid_pixel_count": pair.n_px,
+                      "source_finite_pixel_count": int(
+                          (np.isfinite(lattice) & current_source_mask).sum()
+                      ),
                       "mean_coherence": pair.coherence,
                   })
 
@@ -438,7 +468,7 @@ jobs:
                       & np.isfinite(lattice_arrays[second_index])
                   )
                   print(
-                      f"GUNW_DIAGNOSTIC_PAIRWISE_FINITE_INTERSECTION_"
+                      f"GUNW_DIAGNOSTIC_LANGTANG_PAIRWISE_FINITE_INTERSECTION_"
                       f"{first_index + 1}_{second_index + 1}: "
                       f"{int(intersection.sum())}"
                   )
@@ -446,14 +476,37 @@ jobs:
               for lattice in lattice_arrays[1:]:
                   three_way &= np.isfinite(lattice)
               print(
-                  "GUNW_DIAGNOSTIC_THREE_WAY_FINITE_INTERSECTION: "
+                  "GUNW_DIAGNOSTIC_LANGTANG_THREE_WAY_FINITE_INTERSECTION: "
                   f"{int(three_way.sum())}"
               )
+              common = three_way
+              source_excluded = common & source_measurement_mask
+              stable = common & ~source_measurement_mask
+              print(
+                  "GUNW_COMMON_STABLE_PIXELS_BEFORE_SOURCE_EXCLUSION: "
+                  f"{int(common.sum())}"
+              )
+              print(
+                  "GUNW_SOURCE_AOI_PIXELS_EXCLUDED_FROM_REFERENCE: "
+                  f"{int(source_excluded.sum())}"
+              )
+              print(
+                  "GUNW_COMMON_STABLE_PIXELS_AFTER_SOURCE_EXCLUSION: "
+                  f"{int(stable.sum())}"
+              )
+              print("COMMON_REFERENCE_MIN_REQUIRED: 200")
 
               try:
-                  apply_common_datum(
-                      pairs, lattices, None, None, radius_px=5, buffer_km=2.0
-                  )
+                  stack = [lattices[id(pair)][0] for pair in pairs]
+                  fixed, constants = rereference(stack, stable)
+                  for pair, fixed_lattice in zip(pairs, fixed):
+                      source_values = fixed_lattice[source_measurement_mask]
+                      source_values = source_values[np.isfinite(source_values)]
+                      if source_values.size == 0:
+                          pair.value = None
+                          continue
+                      pair.value = float(np.median(source_values))
+                      pair.n_px = int(source_values.size)
                   if any(pair.value is None for pair in pairs):
                       fail("NISAR_GUNW_TIMESERIES_COMMON_REF_FAILED")
               except StageFailure:
