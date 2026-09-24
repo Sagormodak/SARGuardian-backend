@@ -245,16 +245,26 @@ jobs:
               print(f"GOFF_BUFFER_KM: {BUFFER_KM}")
 
               try:
-                  earthaccess.login(strategy="environment")
-                  results = []
-                  for collection in COLLECTIONS:
-                      collection_results = earthaccess.search_data(
-                          short_name=collection,
-                          temporal=(START, END),
-                          bounding_box=bbox,
-                          count=100,
-                      )
-                      results.extend(collection_results)
+                  discovery_succeeded = False
+                  for _attempt in range(3):
+                      try:
+                          earthaccess.login(strategy="environment")
+                          results = []
+                          for collection in COLLECTIONS:
+                              collection_results = earthaccess.search_data(
+                                  short_name=collection,
+                                  temporal=(START, END),
+                                  bounding_box=bbox,
+                                  count=100,
+                              )
+                              results.extend(collection_results)
+                          discovery_succeeded = True
+                          break
+                      except Exception:
+                          if _attempt == 2:
+                              raise
+                  if not discovery_succeeded:
+                      raise RuntimeError("GOFF discovery did not complete")
                   print(f"GOFF_DISCOVERY_COUNT: {len(results)}")
                   selected_items, missing = choose_documented_stack(results)
                   if selected_items is None:
