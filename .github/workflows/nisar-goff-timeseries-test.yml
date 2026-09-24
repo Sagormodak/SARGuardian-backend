@@ -56,7 +56,10 @@ jobs:
 
           EXPECTED_COMMIT = "77cc9646cfa46d3aff3669d351912f984cf67aa3"
           SCIENCE_REPOSITORY = "Sagormodak/SARGuardian"
-          COLLECTION = "NISAR_L2_GOFF_PROVISIONAL_V1"
+          COLLECTIONS = (
+              "NISAR_L2_GOFF_BETA_V1",
+              "NISAR_L2_GOFF_PROVISIONAL_V1",
+          )
           START = "2025-11-25"
           TARGET_LAT = 28.27799
           TARGET_LON = 85.52983
@@ -229,7 +232,7 @@ jobs:
               lats = [point[1] for point in source_ring]
               bbox = (min(lons), min(lats), max(lons), max(lats))
               print("NISAR_GOFF_TIMESERIES_START")
-              print(f"GOFF_COLLECTION: {COLLECTION}")
+              print(f"GOFF_COLLECTIONS: {', '.join(COLLECTIONS)}")
               print(f"SOURCE_AOI_BBOX: {bbox}")
               print(f"TEMPORAL_START: {START}")
               print(f"TEMPORAL_END: {END}")
@@ -239,12 +242,15 @@ jobs:
 
               try:
                   earthaccess.login(strategy="environment")
-                  results = earthaccess.search_data(
-                      short_name=COLLECTION,
-                      temporal=(START, END),
-                      bounding_box=bbox,
-                      count=100,
-                  )
+                  results = []
+                  for collection in COLLECTIONS:
+                      collection_results = earthaccess.search_data(
+                          short_name=collection,
+                          temporal=(START, END),
+                          bounding_box=bbox,
+                          count=100,
+                      )
+                      results.extend(collection_results)
                   print(f"GOFF_DISCOVERY_COUNT: {len(results)}")
                   selected_items, missing = choose_documented_stack(results)
                   if selected_items is None:
@@ -468,7 +474,7 @@ jobs:
                       "test_type": "software_execution_test_only",
                       "science_repository": SCIENCE_REPOSITORY,
                       "science_commit": EXPECTED_COMMIT,
-                      "collection": COLLECTION,
+                      "collections": list(COLLECTIONS),
                       "reference_strategy": {
                           "aoi": "source",
                           "target_lat": TARGET_LAT,
