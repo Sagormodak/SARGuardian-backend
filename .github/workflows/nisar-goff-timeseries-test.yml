@@ -600,3 +600,12 @@ jobs:
           name: nisar-goff-candidate4-result-${{ github.run_id }}
           path: result/
           if-no-files-found: error
+
+      - name: Upload GOFF result package to Google Drive
+        if: success()
+        env:
+          GOOGLE_DRIVE_OAUTH_CLIENT_JSON: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_JSON }}
+          GOOGLE_DRIVE_PARENT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_PARENT_FOLDER_ID }}
+          GOOGLE_DRIVE_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_REFRESH_TOKEN }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: python scripts/upload_goff_result_to_drive.py
