@@ -266,9 +266,22 @@ def main():
 
         print("DRIVE_UPLOAD_STARTED")
         print("DRIVE_RAW_H5_COUNT: 0")
-        access_token = refresh_access_token(client_id, client_secret, refresh_token)
-        verify_authenticated_account(access_token)
-        folder_id = create_run_folder(access_token, parent_folder_id, run_id)
+        try:
+            access_token = refresh_access_token(
+                client_id, client_secret, refresh_token
+            )
+        except DriveUploadError:
+            raise DriveUploadError("DRIVE_TOKEN_REFRESH_FAILED") from None
+        try:
+            verify_authenticated_account(access_token)
+        except DriveUploadError:
+            raise DriveUploadError("DRIVE_ACCOUNT_VERIFICATION_FAILED") from None
+        try:
+            folder_id = create_run_folder(
+                access_token, parent_folder_id, run_id
+            )
+        except DriveUploadError:
+            raise DriveUploadError("DRIVE_FOLDER_CREATION_FAILED") from None
         print(f"DRIVE_FOLDER_ID: {folder_id}")
 
         uploaded_file_ids = {}
