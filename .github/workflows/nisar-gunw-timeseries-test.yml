@@ -1,0 +1,497 @@
+name: NISAR GUNW Real Time-Series Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  gunw-timeseries:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Checkout pinned SARGuardian science source
+        uses: actions/checkout@v4
+        with:
+          repository: Sagormodak/SARGuardian
+          ref: 77cc9646cfa46d3aff3669d351912f984cf67aa3
+          path: science-source
+
+      - name: Verify science source revision
+        shell: bash
+        run: |
+          expected="77cc9646cfa46d3aff3669d351912f984cf67aa3"
+          actual="$(git -C science-source rev-parse HEAD)"
+          test "$actual" = "$expected"
+
+      - name: Install pinned science requirements and Earthaccess
+        run: |
+          python -m pip install --requirement science-source/requirements.txt
+          python -m pip install --upgrade earthaccess
+
+      - name: Run sequential real GUNW time-series feasibility test
+        env:
+          EARTHDATA_USERNAME: ${{ secrets.EARTHDATA_USERNAME }}
+          EARTHDATA_PASSWORD: ${{ secrets.EARTHDATA_PASSWORD }}
+        run: |
+          SCIENCE_ROOT="$PWD/science-source" python - <<'PY'
+          import contextlib
+          import csv
+          import gc
+          import io
+          import json
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          import threading
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from time import monotonic
+
+          EXPECTED_COMMIT = "77cc9646cfa46d3aff3669d351912f984cf67aa3"
+          SCIENCE_REPOSITORY = "Sagormodak/SARGuardian"
+          COLLECTION = "NISAR_L2_GUNW_PROVISIONAL_V1"
+          START = "2026-06-17"
+          LOW_DISK_BYTES = 2 * 1024 ** 3
+          CHAIN_LENGTH = 3
+          NORMAL_REPEAT_DAYS = 12
+          SCIENCE_ROOT = Path(os.environ["SCIENCE_ROOT"])
+          END = datetime.now(timezone.utc).date().isoformat()
+          raw_dir = Path(tempfile.mkdtemp(prefix="nisar-gunw-timeseries-"))
+          summary_path = Path(tempfile.gettempdir()) / "nisar-gunw-timeseries-summary.json"
+          csv_path = Path(tempfile.gettempdir()) / "nisar-gunw-timeseries.csv"
+          failure_marker = None
+          cleanup_succeeded = False
+          success = False
+          test_started_at = datetime.now(timezone.utc)
+          test_start = monotonic()
+          download_records = []
+          read_records = []
+
+          class StageFailure(Exception):
+              pass
+
+          def fail(marker):
+              raise StageFailure(marker)
+
+          def disk_snapshot(label):
+              usage = shutil.disk_usage("/")
+              print(f"DISK_{label}_AVAILABLE_BYTES: {usage.free}")
+              return usage.free
+
+          def rss_bytes():
+              try:
+                  for line in Path("/proc/self/status").read_text().splitlines():
+                      if line.startswith("VmRSS:"):
+                          return int(line.split()[1]) * 1024
+              except (OSError, ValueError, IndexError):
+                  pass
+              return None
+
+          def peak_rss_worker(stop_event, peak):
+              while not stop_event.is_set():
+                  current = rss_bytes()
+                  if current is not None:
+                      peak[0] = max(peak[0], current)
+                  stop_event.wait(0.05)
+
+          def safe_name(result):
+              if hasattr(result, "get"):
+                  umm = result.get("umm", {})
+                  if isinstance(umm, dict):
+                      name = umm.get("GranuleUR")
+                      if name:
+                          return Path(str(name)).name
+                  for key in ("producer_granule_id", "granuleName", "name"):
+                      if result.get(key):
+                          return Path(str(result[key])).name
+              for attr in ("granule_ur", "name"):
+                  value = getattr(result, attr, None)
+                  if value:
+                      return Path(str(value)).name
+              return "unknown"
+
+          def parse_granule(name, result):
+              stamps = re.findall(r"_(\d{8})T\d{6}", name)
+              track = re.search(
+                  r"NISAR_L2_(?:PR|UR)_[A-Z]+_\d+_(\d{3})_([AD])_", name
+              )
+              processing = re.search(r"NISAR_L2_([A-Z]{2})_", name)
+              if len(stamps) < 4 or track is None:
+                  return None
+              try:
+                  ref = datetime.strptime(stamps[0], "%Y%m%d").date()
+                  sec = datetime.strptime(stamps[2], "%Y%m%d").date()
+              except ValueError:
+                  return None
+              return {
+                  "result": result,
+                  "name": name,
+                  "ref": ref,
+                  "sec": sec,
+                  "direction": track.group(2),
+                  "path": int(track.group(1)),
+                  "processing": processing.group(1) if processing else "??",
+                  "span_days": (sec - ref).days,
+              }
+
+          def edge_key(item):
+              return (
+                  item["direction"], item["path"],
+                  item["ref"], item["sec"],
+              )
+
+          def choose_network(results):
+              parsed = []
+              for result in results:
+                  item = parse_granule(safe_name(result), result)
+                  if item is not None:
+                      parsed.append(item)
+
+              # Keep one deterministic product for each acquisition edge; PR is
+              # preferred over UR, never averaged with it or used as a second edge.
+              by_edge = {}
+              for item in sorted(parsed, key=lambda x: (
+                      x["direction"], x["path"], x["ref"], x["sec"],
+                      0 if x["processing"] == "PR" else 1, x["name"])):
+                  by_edge.setdefault(edge_key(item), item)
+
+              chains = []
+              edges = list(by_edge.values())
+              for first in edges:
+                  for second in edges:
+                      if second["ref"] != first["sec"]:
+                          continue
+                      if (second["direction"], second["path"]) != (
+                              first["direction"], first["path"]):
+                          continue
+                      for third in edges:
+                          if third["ref"] != second["sec"]:
+                              continue
+                          if (third["direction"], third["path"]) != (
+                                  first["direction"], first["path"]):
+                              continue
+                          keys = {edge_key(first), edge_key(second), edge_key(third)}
+                          if len(keys) != CHAIN_LENGTH:
+                              continue
+                          chain = (first, second, third)
+                          score = (
+                              sum(abs(p["span_days"] - NORMAL_REPEAT_DAYS)
+                                  for p in chain),
+                              tuple(p["span_days"] for p in chain),
+                              tuple(p["ref"] for p in chain),
+                              tuple(p["name"] for p in chain),
+                          )
+                          chains.append((score, chain))
+              if not chains:
+                  return None
+              return min(chains, key=lambda item: item[0])[1]
+
+          def grid_signature(grid):
+              return (
+                  grid["height"], grid["width"],
+                  str(grid["transform"]),
+                  float(grid["res_x"]), float(grid["res_y"]),
+                  tuple(grid["rows"].tolist()), tuple(grid["cols"].tolist()),
+              )
+
+          try:
+              sys.path.insert(0, str(SCIENCE_ROOT / "src"))
+              import earthaccess
+              import gunw_reader
+              from gunw_reader import aoi_grid, place_on_grid, read_gunw, set_aoi
+              from timeseries import (
+                  Pair, apply_common_datum, connected_components,
+                  invert_component, report_series,
+              )
+
+              actual_commit = subprocess.check_output(
+                  ["git", "-C", str(SCIENCE_ROOT), "rev-parse", "HEAD"],
+                  text=True,
+              ).strip()
+              if actual_commit != EXPECTED_COMMIT:
+                  raise RuntimeError("science source revision mismatch")
+
+              set_aoi("source")
+              source_ring = gunw_reader.AOIS["source"]
+              lons = [point[0] for point in source_ring]
+              lats = [point[1] for point in source_ring]
+              bbox = (min(lons), min(lats), max(lons), max(lats))
+              print("NISAR_GUNW_TIMESERIES_START")
+              print(f"SOURCE_AOI_BBOX: {bbox}")
+              print(f"TEMPORAL_START: {START}")
+              print(f"TEMPORAL_END: {END}")
+
+              try:
+                  earthaccess.login(strategy="environment")
+                  results = earthaccess.search_data(
+                      short_name=COLLECTION,
+                      temporal=(START, END),
+                      bounding_box=bbox,
+                      count=25,
+                  )
+                  chain = choose_network(results)
+                  if chain is None:
+                      print("NISAR_GUNW_TIMESERIES_NETWORK_NOT_FOUND")
+                      fail("NISAR_GUNW_TIMESERIES_NETWORK_NOT_FOUND")
+                  print("SELECTED_GUNW_CHAIN:")
+                  for item in chain:
+                      print(
+                          f"  {item['name']}  direction={item['direction']} "
+                          f"path={item['path']} ref={item['ref']} "
+                          f"secondary={item['sec']} baseline_days={item['span_days']}"
+                      )
+              except StageFailure:
+                  raise
+              except Exception:
+                  fail("NISAR_GUNW_TIMESERIES_DISCOVERY_FAILED")
+
+              pairs = [
+                  Pair(
+                      path=item["path"], direction=item["direction"],
+                      ref=item["ref"], sec=item["sec"],
+                      value=None, n_px=None, coherence=None,
+                      source=item["name"],
+                  )
+                  for item in chain
+              ]
+              lattices = {}
+              expected_grid_signature = None
+
+              for item, pair in zip(chain, pairs):
+                  disk_before = disk_snapshot("BEFORE_DOWNLOAD")
+                  if disk_before < LOW_DISK_BYTES:
+                      fail("NISAR_GUNW_TIMESERIES_LOW_DISK")
+                  raw_started = datetime.now(timezone.utc)
+                  raw_start = monotonic()
+                  try:
+                      earthaccess.download([item["result"]], local_path=raw_dir)
+                  except Exception:
+                      if shutil.disk_usage("/").free < LOW_DISK_BYTES:
+                          fail("NISAR_GUNW_TIMESERIES_LOW_DISK")
+                      fail("NISAR_GUNW_TIMESERIES_DOWNLOAD_FAILED")
+                  raw_download_finished = datetime.now(timezone.utc)
+                  raw_download_elapsed = monotonic() - raw_start
+                  raw_files = sorted(raw_dir.rglob("*.h5"))
+                  if len(raw_files) != 1:
+                      fail("NISAR_GUNW_TIMESERIES_DOWNLOAD_FAILED")
+                  raw_path = raw_files[0]
+                  file_size = raw_path.stat().st_size
+                  disk_after_download = disk_snapshot("AFTER_DOWNLOAD")
+
+                  rss_before = rss_bytes()
+                  peak = [rss_before or 0]
+                  monitor_stop = threading.Event()
+                  monitor = threading.Thread(
+                      target=peak_rss_worker,
+                      args=(monitor_stop, peak),
+                      daemon=True,
+                  )
+                  read_started = datetime.now(timezone.utc)
+                  read_start = monotonic()
+                  monitor.start()
+                  try:
+                      result = read_gunw(
+                          raw_path,
+                          clip_aoi=True,
+                          auto_ref=True,
+                      )
+                  except Exception:
+                      fail("NISAR_GUNW_TIMESERIES_READ_FAILED")
+                  finally:
+                      monitor_stop.set()
+                      monitor.join(timeout=2)
+                  read_finished = datetime.now(timezone.utc)
+                  read_elapsed = monotonic() - read_start
+                  rss_after = rss_bytes()
+
+                  try:
+                      grid = aoi_grid(
+                          result["xs"], result["ys"],
+                          gunw_reader.AOI_RING, result["epsg"],
+                      )
+                      if grid is None:
+                          fail("NISAR_GUNW_TIMESERIES_READ_FAILED")
+                      signature = grid_signature(grid)
+                      if expected_grid_signature is None:
+                          expected_grid_signature = signature
+                      elif signature != expected_grid_signature:
+                          fail("NISAR_GUNW_TIMESERIES_READ_FAILED")
+                      valid = result["valid"]
+                      lattice = place_on_grid(
+                          __import__("numpy").where(
+                              valid, result["displacement_mm"], __import__("numpy").nan
+                          ),
+                          grid,
+                      )
+                      pair.n_px = int(valid.sum())
+                      coherence = result.get("coherence")
+                      pair.coherence = (
+                          float(coherence[valid].mean())
+                          if coherence is not None and valid.any() else None
+                      )
+                      lattices[id(pair)] = (lattice, grid, result["epsg"])
+                  except StageFailure:
+                      raise
+                  except Exception:
+                      fail("NISAR_GUNW_TIMESERIES_READ_FAILED")
+                  finally:
+                      del result
+                      gc.collect()
+
+                  try:
+                      raw_path.unlink()
+                      if raw_path.exists() or list(raw_dir.rglob("*.h5")):
+                          fail("NISAR_GUNW_TIMESERIES_READ_FAILED")
+                  except StageFailure:
+                      raise
+                  except Exception:
+                      fail("NISAR_GUNW_TIMESERIES_READ_FAILED")
+                  disk_after_delete = disk_snapshot("AFTER_RAW_DELETE")
+                  read_records.append({
+                      "product": item["name"],
+                      "file_size_bytes": file_size,
+                      "download_started_utc": raw_started.isoformat(),
+                      "download_finished_utc": raw_download_finished.isoformat(),
+                      "download_elapsed_seconds": round(raw_download_elapsed, 3),
+                      "read_started_utc": read_started.isoformat(),
+                      "read_finished_utc": read_finished.isoformat(),
+                      "read_elapsed_seconds": round(read_elapsed, 3),
+                      "rss_before_bytes": rss_before,
+                      "rss_peak_observed_bytes": peak[0],
+                      "rss_after_bytes": rss_after,
+                      "disk_before_download_available_bytes": disk_before,
+                      "disk_after_download_available_bytes": disk_after_download,
+                      "disk_after_raw_delete_available_bytes": disk_after_delete,
+                      "valid_pixel_count": pair.n_px,
+                      "mean_coherence": pair.coherence,
+                  })
+
+              try:
+                  apply_common_datum(
+                      pairs, lattices, None, None, radius_px=5, buffer_km=2.0
+                  )
+                  if any(pair.value is None for pair in pairs):
+                      fail("NISAR_GUNW_TIMESERIES_COMMON_REF_FAILED")
+              except StageFailure:
+                  raise
+              except Exception:
+                  fail("NISAR_GUNW_TIMESERIES_COMMON_REF_FAILED")
+
+              expected_epochs = sorted({
+                  epoch for pair in pairs for epoch in (pair.ref, pair.sec)
+              })
+              try:
+                  components = connected_components(pairs)
+                  component = next(
+                      component for component in components
+                      if set(expected_epochs).issubset(component)
+                  )
+                  if len(component) != 4:
+                      fail("NISAR_GUNW_TIMESERIES_INVERSION_FAILED")
+                  result = invert_component(
+                      [pair for pair in pairs if pair.ref in component and pair.sec in component],
+                      component,
+                  )
+                  if "error" in result:
+                      fail("NISAR_GUNW_TIMESERIES_INVERSION_FAILED")
+              except StageFailure:
+                  raise
+              except Exception:
+                  fail("NISAR_GUNW_TIMESERIES_INVERSION_FAILED")
+
+              try:
+                  label = f"{'ASC' if pairs[0].direction == 'A' else 'DESC'} path {pairs[0].path}"
+                  report_rows = report_series(label, 1, result)
+                  if len(report_rows) != len(component):
+                      fail("NISAR_GUNW_TIMESERIES_OUTPUT_FAILED")
+                  compact = {
+                      "test_type": "software_execution_test_only",
+                      "science_repository": SCIENCE_REPOSITORY,
+                      "science_commit": EXPECTED_COMMIT,
+                      "collection": COLLECTION,
+                      "selected_products": [
+                          {
+                              "identifier": item["name"],
+                              "direction": item["direction"],
+                              "path": item["path"],
+                              "ref": str(item["ref"]),
+                              "secondary": str(item["sec"]),
+                              "temporal_baseline_days": item["span_days"],
+                              "processing": item["processing"],
+                          }
+                          for item in chain
+                      ],
+                      "pair_measurements": [
+                          {
+                              "ref": str(pair.ref), "secondary": str(pair.sec),
+                              "direction": pair.direction, "path": pair.path,
+                              "value_mm": pair.value, "valid_pixel_count": pair.n_px,
+                              "mean_coherence": pair.coherence,
+                          }
+                          for pair in pairs
+                      ],
+                      "network_epochs": [str(epoch) for epoch in component],
+                      "cumulative_displacement_rows": report_rows,
+                      "residual_rms_mm": result["residual_rms_mm"],
+                      "sigma_mm": result["sigma_mm"],
+                      "degrees_of_freedom": result["dof"],
+                      "number_of_pairs": result["n_pairs"],
+                      "velocity_mm_per_day": result["velocity_mm_per_day"],
+                      "velocity_error_mm_per_day": result["velocity_err_mm_per_day"],
+                      "velocity_note": "tiny-network software-execution output only",
+                      "download_and_read_records": read_records,
+                      "test_started_utc": test_started_at.isoformat(),
+                      "test_elapsed_seconds": round(monotonic() - test_start, 3),
+                  }
+                  summary_path.write_text(json.dumps(compact, indent=2) + "\n")
+                  with csv_path.open("w", newline="") as fh:
+                      fields = [
+                          "geometry", "component", "epoch", "days_from_start",
+                          "cumulative_mm", "error_mm",
+                      ]
+                      writer = csv.DictWriter(fh, fieldnames=fields)
+                      writer.writeheader()
+                      writer.writerows(report_rows)
+                  print(f"COMPACT_JSON_PATH: {summary_path}")
+                  print(f"COMPACT_CSV_PATH: {csv_path}")
+              except StageFailure:
+                  raise
+              except Exception:
+                  fail("NISAR_GUNW_TIMESERIES_OUTPUT_FAILED")
+              success = True
+          except StageFailure as exc:
+              failure_marker = str(exc)
+          except Exception:
+              failure_marker = failure_marker or "NISAR_GUNW_TIMESERIES_OUTPUT_FAILED"
+          finally:
+              try:
+                  if raw_dir.exists():
+                      for raw_file in raw_dir.rglob("*.h5"):
+                          raw_file.unlink()
+                      shutil.rmtree(raw_dir)
+                  if raw_dir.exists():
+                      raise RuntimeError("raw directory remains")
+                  cleanup_succeeded = True
+                  print("NISAR_GUNW_TIMESERIES_RAW_CLEANUP_SUCCESS")
+              except Exception:
+                  cleanup_succeeded = False
+                  failure_marker = "NISAR_GUNW_TIMESERIES_RAW_CLEANUP_FAILED"
+                  print("NISAR_GUNW_TIMESERIES_RAW_CLEANUP_FAILED")
+
+          if failure_marker is not None:
+              print(failure_marker)
+              print("SAFE_ERROR: operation failed")
+              sys.exit(1)
+          if not success or not cleanup_succeeded:
+              print("NISAR_GUNW_TIMESERIES_OUTPUT_FAILED")
+              print("SAFE_ERROR: operation failed")
+              sys.exit(1)
+          print("NISAR_GUNW_TIMESERIES_SUCCESS")
+          PY
