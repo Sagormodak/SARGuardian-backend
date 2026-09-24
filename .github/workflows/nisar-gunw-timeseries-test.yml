@@ -43,6 +43,7 @@ jobs:
           import gc
           import io
           import json
+          import numpy as np
           import os
           import re
           import shutil
@@ -73,6 +74,7 @@ jobs:
           test_start = monotonic()
           download_records = []
           read_records = []
+          grid_signatures = []
 
           class StageFailure(Exception):
               pass
@@ -313,6 +315,36 @@ jobs:
                   read_finished = datetime.now(timezone.utc)
                   read_elapsed = monotonic() - read_start
                   rss_after = rss_bytes()
+                  diagnostic_valid = result["valid"]
+                  diagnostic_disp = result["displacement_mm"]
+                  diagnostic_coherence = result.get("coherence")
+                  print(
+                      f"GUNW_DIAGNOSTIC_PRODUCT: {item['name']} "
+                      f"direction={item['direction']} path={item['path']} "
+                      f"ref={item['ref']} secondary={item['sec']} "
+                      f"baseline_days={item['span_days']}"
+                  )
+                  print(
+                      "GUNW_DIAGNOSTIC_RAW_VALID_PIXELS: "
+                      f"{int(diagnostic_valid.sum())}"
+                  )
+                  print(
+                      "GUNW_DIAGNOSTIC_NONFINITE_DISPLACEMENT_PIXELS: "
+                      f"{int((~np.isfinite(diagnostic_disp)).sum())}"
+                  )
+                  if diagnostic_coherence is not None:
+                      print("GUNW_DIAGNOSTIC_COHERENCE_ARRAY_AVAILABLE: True")
+                      coherence_below = int(
+                          (np.isfinite(diagnostic_coherence)
+                           & (diagnostic_coherence < 0.3)).sum()
+                      )
+                      print(
+                          "GUNW_DIAGNOSTIC_COHERENCE_BELOW_0_3_PIXELS: "
+                          f"{coherence_below}"
+                      )
+                  else:
+                      print("GUNW_DIAGNOSTIC_COHERENCE_ARRAY_AVAILABLE: False")
+                  print("GUNW_DIAGNOSTIC_CONNECTED_COMPONENTS_ARRAY_AVAILABLE: False")
 
                   try:
                       grid = aoi_grid(
@@ -322,6 +354,7 @@ jobs:
                       if grid is None:
                           fail("NISAR_GUNW_TIMESERIES_READ_FAILED")
                       signature = grid_signature(grid)
+                      grid_signatures.append(signature)
                       if expected_grid_signature is None:
                           expected_grid_signature = signature
                       elif signature != expected_grid_signature:
@@ -332,6 +365,10 @@ jobs:
                               valid, result["displacement_mm"], __import__("numpy").nan
                           ),
                           grid,
+                      )
+                      print(
+                          "GUNW_DIAGNOSTIC_LATTICE_FINITE_PIXELS: "
+                          f"{int(np.isfinite(lattice).sum())}"
                       )
                       pair.n_px = int(valid.sum())
                       coherence = result.get("coherence")
@@ -375,6 +412,43 @@ jobs:
                       "valid_pixel_count": pair.n_px,
                       "mean_coherence": pair.coherence,
                   })
+
+              lattice_arrays = [lattices[id(pair)][0] for pair in pairs]
+              lattice_shape = lattice_arrays[0].shape
+              lattice_shapes_equal = all(
+                  lattice.shape == lattice_shape for lattice in lattice_arrays
+              )
+              grid_signatures_equal = (
+                  len(grid_signatures) == len(pairs)
+                  and all(signature == grid_signatures[0]
+                          for signature in grid_signatures[1:])
+              )
+              print(f"GUNW_DIAGNOSTIC_LATTICE_SHAPE: {lattice_shape}")
+              print(
+                  "GUNW_DIAGNOSTIC_LATTICE_SHAPES_EQUAL: "
+                  f"{lattice_shapes_equal}"
+              )
+              print(
+                  "GUNW_DIAGNOSTIC_GRID_SIGNATURES_EQUAL: "
+                  f"{grid_signatures_equal}"
+              )
+              for first_index, second_index in ((0, 1), (0, 2), (1, 2)):
+                  intersection = (
+                      np.isfinite(lattice_arrays[first_index])
+                      & np.isfinite(lattice_arrays[second_index])
+                  )
+                  print(
+                      f"GUNW_DIAGNOSTIC_PAIRWISE_FINITE_INTERSECTION_"
+                      f"{first_index + 1}_{second_index + 1}: "
+                      f"{int(intersection.sum())}"
+                  )
+              three_way = np.isfinite(lattice_arrays[0])
+              for lattice in lattice_arrays[1:]:
+                  three_way &= np.isfinite(lattice)
+              print(
+                  "GUNW_DIAGNOSTIC_THREE_WAY_FINITE_INTERSECTION: "
+                  f"{int(three_way.sum())}"
+              )
 
               try:
                   apply_common_datum(
