@@ -71,6 +71,7 @@ jobs:
           raw_dir = Path(tempfile.mkdtemp(prefix="nisar-goff-timeseries-"))
           summary_path = Path(tempfile.gettempdir()) / "nisar-goff-timeseries-summary.json"
           csv_path = Path(tempfile.gettempdir()) / "nisar-goff-timeseries.csv"
+          result_dir = Path("result")
           failure_marker = None
           cleanup_succeeded = False
           success = False
@@ -514,6 +515,8 @@ jobs:
                       "read_records": read_records,
                       "test_started_utc": test_started_at.isoformat(),
                       "test_elapsed_seconds": round(monotonic() - test_start, 3),
+                      "raw_cleanup_success": False,
+                      "overall_success": False,
                   }
                   summary_path.write_text(json.dumps(summary, indent=2) + "\n")
                   with csv_path.open("w", newline="") as fh:
@@ -524,8 +527,32 @@ jobs:
                       writer = csv.DictWriter(fh, fieldnames=fields)
                       writer.writeheader()
                       writer.writerows(all_rows)
+                  result_dir.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(summary_path, result_dir / "result.json")
+                  shutil.copy2(csv_path, result_dir / "timeseries.csv")
+                  (result_dir / "manifest.json").write_text(
+                      json.dumps(summary, indent=2) + "\n"
+                  )
+                  (result_dir / "README.txt").write_text(
+                      "SARGuardian GOFF candidate-4 time-series feasibility result\n"
+                      "\n"
+                      "This package records a software execution feasibility test, "
+                      "not scientific event evidence.\n"
+                      f"Science commit: {EXPECTED_COMMIT}\n"
+                      "Workflow: sequential Earthaccess GOFF downloads, pinned "
+                      "read_goff layer2 processing, source-AOI fixed-lattice "
+                      "common reference, candidate-4 target-window measurement, "
+                      "and existing time-series inversion.\n"
+                      "result.json contains the compact run summary.\n"
+                      "timeseries.csv contains cumulative time-series rows.\n"
+                      "manifest.json records provenance, selections, measurements, "
+                      "inversions, timings, and cleanup status.\n"
+                      "Raw NISAR HDF5 products are deleted immediately after "
+                      "derived processing and are not included in this package.\n"
+                  )
                   print(f"GOFF_COMPACT_JSON_PATH: {summary_path}")
                   print(f"GOFF_COMPACT_CSV_PATH: {csv_path}")
+                  print(f"GOFF_RESULT_DIR: {result_dir}")
               except StageFailure:
                   raise
               except Exception:
@@ -545,6 +572,18 @@ jobs:
                       raise RuntimeError("raw directory remains")
                   cleanup_succeeded = True
                   print("NISAR_GOFF_TIMESERIES_RAW_CLEANUP_SUCCESS")
+                  if success and result_dir.exists():
+                      manifest = json.loads(
+                          (result_dir / "manifest.json").read_text()
+                      )
+                      manifest["raw_cleanup_success"] = True
+                      manifest["overall_success"] = True
+                      manifest["test_elapsed_seconds"] = round(
+                          monotonic() - test_start, 3
+                      )
+                      (result_dir / "manifest.json").write_text(
+                          json.dumps(manifest, indent=2) + "\n"
+                      )
               except Exception:
                   cleanup_succeeded = False
                   failure_marker = "NISAR_GOFF_TIMESERIES_RAW_CLEANUP_FAILED"
@@ -560,3 +599,11 @@ jobs:
               sys.exit(1)
           print("NISAR_GOFF_TIMESERIES_SUCCESS")
           PY
+
+            - name: Upload GOFF feasibility result package
+                if: success()
+                uses: actions/upload-artifact@v4
+                with:
+                    name: nisar-goff-candidate4-result-${{ github.run_id }}
+                    path: result/
+                    if-no-files-found: error
