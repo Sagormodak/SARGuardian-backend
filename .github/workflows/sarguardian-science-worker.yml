@@ -56,12 +56,92 @@ jobs:
 
           print("WORKER_INPUT_VALID")
           print(f"WORKER_JOB_ID: {job_id}")
-
-          # Do not print metadata contents; it may contain user-supplied values.
           print("WORKER_METADATA_VALID")
           PY
 
-      - name: Worker smoke test complete
+      - name: Notify Render that worker started
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          WORKER_CALLBACK_SECRET: ${{ secrets.WORKER_CALLBACK_SECRET }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from urllib.request import Request, urlopen
+
+          job_id = os.environ["JOB_ID"]
+          secret = os.environ["WORKER_CALLBACK_SECRET"]
+
+          url = (
+              "https://sarguardian-backend.onrender.com"
+              f"/internal/worker/jobs/{job_id}/callback"
+          )
+
+          payload = json.dumps({
+              "status": "processing"
+          }).encode("utf-8")
+
+          request = Request(
+              url,
+              data=payload,
+              headers={
+                  "Authorization": f"Bearer {secret}",
+                  "Content-Type": "application/json",
+                  "User-Agent": "SARGuardian-GitHub-Worker",
+              },
+              method="POST",
+          )
+
+          with urlopen(request, timeout=30) as response:
+              if response.status != 200:
+                  raise RuntimeError("WORKER_CALLBACK_PROCESSING_FAILED")
+
+          print("WORKER_CALLBACK_PROCESSING_OK")
+          PY
+
+      - name: Worker smoke test
         run: |
           echo "SARGuardian worker dispatch reached GitHub Actions successfully."
           echo "SCIENCE_EXECUTION_NOT_STARTED"
+
+      - name: Mark smoke test complete
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          WORKER_CALLBACK_SECRET: ${{ secrets.WORKER_CALLBACK_SECRET }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from urllib.request import Request, urlopen
+
+          job_id = os.environ["JOB_ID"]
+          secret = os.environ["WORKER_CALLBACK_SECRET"]
+
+          url = (
+              "https://sarguardian-backend.onrender.com"
+              f"/internal/worker/jobs/{job_id}/callback"
+          )
+
+          payload = json.dumps({
+              "status": "failed",
+              "error_code": "WORKER_SMOKE_TEST",
+              "error_message_safe": "Worker smoke test completed; real science was not started",
+          }).encode("utf-8")
+
+          request = Request(
+              url,
+              data=payload,
+              headers={
+                  "Authorization": f"Bearer {secret}",
+                  "Content-Type": "application/json",
+                  "User-Agent": "SARGuardian-GitHub-Worker",
+              },
+              method="POST",
+          )
+
+          with urlopen(request, timeout=30) as response:
+              if response.status != 200:
+                  raise RuntimeError("WORKER_CALLBACK_FAILED")
+
+          print("WORKER_CALLBACK_TERMINAL_OK")
+          PY
