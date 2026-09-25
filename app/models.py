@@ -55,7 +55,12 @@ class Job(Base):
     )
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     status: Mapped[JobStatus] = mapped_column(
-        SqlEnum(JobStatus, native_enum=False, length=20),
+        SqlEnum(
+            JobStatus,
+            values_callable=lambda enum_cls: [item.value for item in enum_cls],
+            native_enum=False,
+            length=20,
+        ),
         default=JobStatus.QUEUED,
         nullable=False,
     )
