@@ -2,10 +2,12 @@ from fastapi import FastAPI
 
 from app.auth import router as auth_router
 from app.jobs import router as jobs_router
+from app.worker_callback import router as worker_callback_router
 
 app = FastAPI(title="SARGuardian Backend", version="0.1.0")
 app.include_router(auth_router)
 app.include_router(jobs_router)
+app.include_router(worker_callback_router)
 
 
 @app.get("/health", tags=["system"])
