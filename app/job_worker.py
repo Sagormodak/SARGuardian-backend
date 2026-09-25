@@ -1,10 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import json
-from typing import Any
 
 from sqlalchemy import select
 
+from app.config import settings
 from app.db import SessionLocal
 from app.models import Job, JobStatus
 from app.science.service import (
@@ -17,6 +17,7 @@ from app.storage.drive_service import (
     DriveService,
     build_drive_service,
 )
+from app.worker_dispatch import WorkerDispatchError, dispatch_job
 
 
 executor = ThreadPoolExecutor(
@@ -29,12 +30,46 @@ drive_service_override: DriveService | None = None
 session_factory_override = None
 
 
-def submit_job(job_id: str) -> None:
-    executor.submit(process_job, job_id)
-
-
 def _new_session():
     return (session_factory_override or SessionLocal)()
+
+
+def submit_job(job_id: str) -> None:
+    if settings.worker_mode == "github":
+        db = _new_session()
+        job = None
+
+        try:
+            job = db.scalar(
+                select(Job).where(Job.job_id == job_id)
+            )
+
+            if job is None:
+                return
+
+            parameters = json.loads(
+                job.processing_metadata_json
+            )
+
+            dispatch_job(
+                job_id,
+                parameters,
+            )
+
+        except WorkerDispatchError:
+            if job is not None:
+                job.status = JobStatus.FAILED
+                job.error_code = "WORKER_DISPATCH_FAILED"
+                job.error_message_safe = "Science worker could not be started"
+                job.completed_at = datetime.now(timezone.utc)
+                db.commit()
+
+        finally:
+            db.close()
+
+        return
+
+    executor.submit(process_job, job_id)
 
 
 def process_job(job_id: str) -> None:
