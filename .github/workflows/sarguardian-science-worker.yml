@@ -1,0 +1,67 @@
+name: SARGuardian Science Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "SARGuardian job ID"
+        required: true
+        type: string
+      processing_metadata:
+        description: "Sanitized job processing metadata as JSON"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  worker-smoke-test:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout backend
+        uses: actions/checkout@v4
+
+      - name: Validate worker inputs
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          PROCESSING_METADATA: ${{ inputs.processing_metadata }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          job_id = os.environ["JOB_ID"]
+          metadata_raw = os.environ["PROCESSING_METADATA"]
+
+          if not job_id or not re.fullmatch(
+              r"[0-9a-fA-F-]{8,64}",
+              job_id,
+          ):
+              print("WORKER_INPUT_INVALID")
+              sys.exit(1)
+
+          try:
+              metadata = json.loads(metadata_raw)
+          except json.JSONDecodeError:
+              print("WORKER_INPUT_INVALID")
+              sys.exit(1)
+
+          if not isinstance(metadata, dict):
+              print("WORKER_INPUT_INVALID")
+              sys.exit(1)
+
+          print("WORKER_INPUT_VALID")
+          print(f"WORKER_JOB_ID: {job_id}")
+
+          # Do not print metadata contents; it may contain user-supplied values.
+          print("WORKER_METADATA_VALID")
+          PY
+
+      - name: Worker smoke test complete
+        run: |
+          echo "SARGuardian worker dispatch reached GitHub Actions successfully."
+          echo "SCIENCE_EXECUTION_NOT_STARTED"
