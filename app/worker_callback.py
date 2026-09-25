@@ -1,8 +1,9 @@
 from datetime import datetime, timezone
 import hmac
+import json
 from typing import Literal
 
-from fastapi import APIRouter, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -26,7 +27,9 @@ class WorkerCallback(BaseModel):
     error_message_safe: str | None = None
 
 
-def _verify_callback_secret(authorization: str | None) -> None:
+def _verify_callback_secret(
+    authorization: str | None,
+) -> None:
     expected = settings.worker_callback_secret.strip()
 
     if not expected:
@@ -36,6 +39,7 @@ def _verify_callback_secret(authorization: str | None) -> None:
         )
 
     prefix = "Bearer "
+
     if not authorization or not authorization.startswith(prefix):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -56,7 +60,7 @@ def worker_callback(
     job_id: str,
     payload: WorkerCallback,
     authorization: str | None = Header(default=None),
-    db: Session = next(get_db()),
+    db: Session = Depends(get_db),
 ) -> dict[str, str]:
     _verify_callback_secret(authorization)
 
@@ -78,6 +82,7 @@ def worker_callback(
             JobStatus.PROCESSING,
         ):
             job.status = JobStatus.PROCESSING
+
             if job.started_at is None:
                 job.started_at = now
 
@@ -91,8 +96,6 @@ def worker_callback(
             job.result_folder_id = payload.result_folder_id
 
         if payload.result_file_ids is not None:
-            import json
-
             job.result_file_ids_json = json.dumps(
                 payload.result_file_ids
             )
