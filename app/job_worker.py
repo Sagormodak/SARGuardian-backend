@@ -1,54 +1,122 @@
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 import json
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from typing import Any
 
-from app.config import settings
+from sqlalchemy import select
+
+from app.db import SessionLocal
+from app.models import Job, JobStatus
+from app.science.service import (
+    ScienceExecutionError,
+    ScienceService,
+    build_science_service,
+)
+from app.storage.drive_service import (
+    DriveServiceError,
+    DriveService,
+    build_drive_service,
+)
 
 
-class WorkerDispatchError(RuntimeError):
-    """Raised when a GitHub Actions worker cannot be dispatched."""
+executor = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="sarguardian-job",
+)
+
+science_service_override: ScienceService | None = None
+drive_service_override: DriveService | None = None
+session_factory_override = None
 
 
-def dispatch_job(job_id: str, parameters: dict) -> None:
-    if not settings.github_actions_token:
-        raise WorkerDispatchError("Worker dispatch is not configured")
+def submit_job(job_id: str) -> None:
+    executor.submit(process_job, job_id)
 
-    payload = json.dumps(
-        {
-            "ref": "main",
-            "inputs": {
-                "job_id": job_id,
-                "processing_metadata": json.dumps(
-                    parameters,
-                    separators=(",", ":"),
-                ),
-            },
-        }
-    ).encode("utf-8")
 
-    url = (
-        "https://api.github.com/repos/"
-        f"{settings.github_actions_repository}/actions/workflows/"
-        f"{settings.github_actions_workflow}/dispatches"
-    )
+def _new_session():
+    return (session_factory_override or SessionLocal)()
 
-    request = Request(
-        url,
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {settings.github_actions_token}",
-            "Accept": "application/vnd.github+json",
-            "Content-Type": "application/json",
-            "User-Agent": "SARGuardian-worker-dispatch",
-        },
-        method="POST",
-    )
+
+def process_job(job_id: str) -> None:
+    db = _new_session()
+    job = None
 
     try:
-        with urlopen(request, timeout=30) as response:
-            if response.status not in (200, 201, 202, 204):
-                raise WorkerDispatchError("Worker dispatch failed")
-    except HTTPError as exc:
-        raise WorkerDispatchError("Worker dispatch failed") from exc
-    except (URLError, OSError, TimeoutError) as exc:
-        raise WorkerDispatchError("Worker dispatch failed") from exc
+        job = db.scalar(
+            select(Job).where(Job.job_id == job_id)
+        )
+
+        if job is None:
+            return
+
+        job.status = JobStatus.PROCESSING
+        job.started_at = datetime.now(timezone.utc)
+        db.commit()
+
+        parameters = json.loads(
+            job.processing_metadata_json
+        )
+
+        service = (
+            science_service_override
+            or build_science_service()
+        )
+
+        result = service.run(
+            job.job_id,
+            parameters,
+        )
+
+        drive_service = (
+            drive_service_override
+            or build_drive_service()
+        )
+
+        drive_result = drive_service.upload_result_package(
+            job.job_id,
+            result.package,
+        )
+
+        metadata = {
+            **parameters,
+            **result.metadata,
+        }
+
+        job.processing_metadata_json = json.dumps(
+            metadata
+        )
+
+        job.result_folder_id = drive_result.folder_id
+
+        job.result_file_ids_json = json.dumps(
+            drive_result.file_ids
+        )
+
+        job.status = JobStatus.COMPLETED
+        job.completed_at = datetime.now(timezone.utc)
+        job.error_code = None
+        job.error_message_safe = None
+
+    except ScienceExecutionError as exc:
+        job.status = JobStatus.FAILED
+        job.error_code = exc.code
+        job.error_message_safe = exc.safe_message
+        job.completed_at = datetime.now(timezone.utc)
+
+    except DriveServiceError as exc:
+        job.status = JobStatus.FAILED
+        job.error_code = exc.code
+        job.error_message_safe = exc.safe_message
+        job.completed_at = datetime.now(timezone.utc)
+
+    except Exception:
+        job.status = JobStatus.FAILED
+        job.error_code = "SCIENCE_EXECUTION_FAILED"
+        job.error_message_safe = "Science processing failed"
+        job.completed_at = datetime.now(timezone.utc)
+
+    finally:
+        if job is not None:
+            db.commit()
+
+        db.close()
