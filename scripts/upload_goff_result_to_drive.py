@@ -246,8 +246,30 @@ def verify_result_manifest(result_directory):
         )
     except (OSError, json.JSONDecodeError):
         raise DriveUploadError("DRIVE_RESULT_PACKAGE_INVALID") from None
-    if not isinstance(manifest, dict) or not manifest.get("raw_cleanup_success"):
+    # The science worker writes a detailed manifest that is deliberately
+    # distinct from result.json.  Checking its worker-specific completion
+    # fields prevents an accidental result.json -> manifest.json copy from
+    # being uploaded as a valid package.
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("cleanup_status") != "success"
+        or manifest.get("final_processing_status") != "completed"
+    ):
         raise DriveUploadError("DRIVE_RAW_CLEANUP_NOT_CONFIRMED")
+
+
+def serialized_file_ids(uploaded_file_ids):
+    """Return the exact result-package filename-to-Drive-ID mapping."""
+    if set(uploaded_file_ids) != set(EXPECTED_FILES):
+        raise DriveUploadError("DRIVE_VERIFICATION_FAILED")
+
+    ordered_file_ids = {}
+    for name in EXPECTED_FILES:
+        file_id = uploaded_file_ids.get(name)
+        if not isinstance(file_id, str) or not file_id:
+            raise DriveUploadError("DRIVE_VERIFICATION_FAILED")
+        ordered_file_ids[name] = file_id
+    return json.dumps(ordered_file_ids, separators=(",", ":"))
 
 
 def main():
@@ -287,7 +309,6 @@ def main():
         uploaded_file_ids = {}
         for path in files:
             uploaded_file_ids[path.name] = upload_file(access_token, folder_id, path)
-            print(f"DRIVE_FILE_ID: {uploaded_file_ids[path.name]}")
 
         verified_files = list_run_folder_files(access_token, folder_id)
         verified_ids = {
@@ -307,6 +328,7 @@ def main():
         if any(verified_ids.get(name) != uploaded_file_ids[name] for name in EXPECTED_FILES):
             raise DriveUploadError("DRIVE_VERIFICATION_FAILED")
         print("DRIVE_UPLOAD_VERIFIED")
+        print(f"DRIVE_FILE_IDS_JSON: {serialized_file_ids(uploaded_file_ids)}")
     except DriveUploadError as exc:
         print(str(exc))
         print("DRIVE_UPLOAD_FAILED")

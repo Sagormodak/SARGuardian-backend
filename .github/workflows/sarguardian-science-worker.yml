@@ -93,11 +93,11 @@ jobs:
             ${{ inputs.benchmark_only && '--benchmark-only' || '' }} \
             --parameters "$PARAMETERS_JSON"
 
-      - name: Create result package manifest
+      - name: Complete worker-generated result package
         if: success()
         shell: bash
         run: |
-          cp result/result.json result/manifest.json
+          test -f result/manifest.json
           cat > result/README.txt <<'EOF'
           SARGuardian GOFF time-series result
 
@@ -123,16 +123,19 @@ jobs:
           GOOGLE_DRIVE_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_REFRESH_TOKEN }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
+          set -euo pipefail
           output=$(python scripts/upload_goff_result_to_drive.py)
           echo "$output"
-          folder_id=$(echo "$output" | grep "^DRIVE_FOLDER_ID:" | cut -d' ' -f2)
-          if [ -n "$folder_id" ]; then
-            echo "drive_folder_id=$folder_id" >> "$GITHUB_OUTPUT"
-          fi
-          file_ids_json=$(echo "$output" | grep "^DRIVE_FILE_ID:" | sed 's/^DRIVE_FILE_ID: //' | jq -R . | jq -s 'split("\n") | map(select(length > 0)) | from_entries')
-          if [ -n "$file_ids_json" ] && [ "$file_ids_json" != "{}" ]; then
-            echo "drive_file_ids=$file_ids_json" >> "$GITHUB_OUTPUT"
-          fi
+          folder_id=$(printf '%s\n' "$output" | sed -n 's/^DRIVE_FOLDER_ID: //p' | tail -n 1)
+          file_ids_json=$(printf '%s\n' "$output" | sed -n 's/^DRIVE_FILE_IDS_JSON: //p' | tail -n 1)
+          test -n "$folder_id"
+          printf '%s' "$file_ids_json" | jq -e -c '
+            type == "object"
+            and (keys | sort == ["README.txt", "manifest.json", "result.json", "timeseries.csv"])
+            and all(.[]; type == "string" and length > 0)
+          ' > /dev/null
+          echo "drive_folder_id=$folder_id" >> "$GITHUB_OUTPUT"
+          echo "drive_file_ids=$(printf '%s' "$file_ids_json" | jq -c .)" >> "$GITHUB_OUTPUT"
 
       - name: Callback Render with completion
         if: always()
@@ -143,14 +146,19 @@ jobs:
             if [ "${{ job.status }}" != "success" ]; then
               STATUS="failed"
             fi
-            PAYLOAD="{\"job_id\": \"${{ inputs.job_id }}\", \"status\": \"$STATUS\", \"run_id\": \"${{ github.run_id }}\""
-            if [ "$STATUS" = "completed" ] && [ -n "${{ steps.drive_upload.outputs.drive_folder_id }}" ]; then
-              PAYLOAD="$PAYLOAD, \"result_folder_id\": \"${{ steps.drive_upload.outputs.drive_folder_id }}\""
+            if [ "$STATUS" = "completed" ]; then
+              PAYLOAD=$(jq -cn \
+                --arg job_id "${{ inputs.job_id }}" \
+                --arg run_id "${{ github.run_id }}" \
+                --arg result_folder_id "${{ steps.drive_upload.outputs.drive_folder_id }}" \
+                --argjson result_file_ids '${{ steps.drive_upload.outputs.drive_file_ids }}' \
+                '{job_id: $job_id, status: "completed", run_id: $run_id, result_folder_id: $result_folder_id, result_file_ids: $result_file_ids}')
+            else
+              PAYLOAD=$(jq -cn \
+                --arg job_id "${{ inputs.job_id }}" \
+                --arg run_id "${{ github.run_id }}" \
+                '{job_id: $job_id, status: "failed", run_id: $run_id}')
             fi
-            if [ "$STATUS" = "completed" ] && [ -n "${{ steps.drive_upload.outputs.drive_file_ids }}" ]; then
-              PAYLOAD="$PAYLOAD, \"result_file_ids\": ${{ steps.drive_upload.outputs.drive_file_ids }}"
-            fi
-            PAYLOAD="$PAYLOAD}"
             curl -X POST "${RENDER_CALLBACK_URL}/worker/callback/${{ inputs.job_id }}" \
               -H "Content-Type: application/json" \
               -H "Authorization: Bearer ${WORKER_CALLBACK_SECRET}" \

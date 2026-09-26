@@ -75,6 +75,7 @@ jobs:
           result_dir = Path("result")
           summary_path = result_dir / "result.json"
           csv_path = result_dir / "timeseries.csv"
+          manifest_path = result_dir / "manifest.json"
           failure_marker = None
           cleanup_succeeded = False
           success = False
@@ -583,6 +584,56 @@ jobs:
                       summary_path.write_text(
                           json.dumps(manifest, indent=2) + "\n"
                       )
+                      detailed_manifest = {
+                          "provenance": {
+                              "science_repository": SCIENCE_REPOSITORY,
+                              "science_commit": EXPECTED_COMMIT,
+                              "collections": list(COLLECTIONS),
+                          },
+                          "selected_products": [
+                              item["name"] for item in selected_items
+                          ],
+                          "acquisition_dates": sorted({
+                              str(item["ref"]) for item in selected_items
+                          } | {
+                              str(item["sec"]) for item in selected_items
+                          }),
+                          "processing_timings": read_records,
+                          "disk_measurements": [
+                              {
+                                  "product": record["product"],
+                                  "before_download_bytes": record[
+                                      "disk_before_download_available_bytes"
+                                  ],
+                                  "after_download_bytes": record[
+                                      "disk_after_download_available_bytes"
+                                  ],
+                                  "after_raw_delete_bytes": record[
+                                      "disk_after_raw_delete_available_bytes"
+                                  ],
+                              }
+                              for record in read_records
+                          ],
+                          "peak_memory_bytes": max(
+                              (
+                                  record["rss_peak_observed_bytes"] or 0
+                                  for record in read_records
+                              ),
+                              default=0,
+                          ),
+                          "cleanup_status": "success",
+                          "final_processing_status": "completed",
+                          "processing_parameters": {
+                              "start_date": START,
+                              "target_lat": TARGET_LAT,
+                              "target_lon": TARGET_LON,
+                              "target_radius_pixels": TARGET_RADIUS_PX,
+                              "buffer_km": BUFFER_KM,
+                          },
+                      }
+                      manifest_path.write_text(
+                          json.dumps(detailed_manifest, indent=2) + "\n"
+                      )
               except Exception:
                   cleanup_succeeded = False
                   failure_marker = "NISAR_GOFF_TIMESERIES_RAW_CLEANUP_FAILED"
@@ -599,11 +650,11 @@ jobs:
           print("NISAR_GOFF_TIMESERIES_SUCCESS")
           PY
 
-      - name: Create persistent GOFF result package
+      - name: Complete persistent GOFF result package
         if: success()
         shell: bash
         run: |
-          cp result/result.json result/manifest.json
+          test -f result/manifest.json
           cat > result/README.txt <<'EOF'
           SARGuardian GOFF candidate-4 time-series feasibility result
 
