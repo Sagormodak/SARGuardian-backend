@@ -9,7 +9,9 @@ Supports benchmark mode (single product) and full mode (complete stack).
 import argparse
 import csv
 import gc
+import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -68,12 +70,99 @@ EXPECTED_EDGES = [
 ]
 
 
-def get_runtime_params(parameters: dict) -> tuple[str, float, float]:
-    """Extract runtime parameters with scientifically required defaults."""
+def get_runtime_params(parameters: dict) -> tuple[str, float | None, float | None]:
+    """Extract dates and optional legacy target coordinates."""
     start_date = parameters.get("start_date", "2025-11-25")
-    target_lat = float(parameters.get("target_lat", 28.27799))
-    target_lon = float(parameters.get("target_lon", 85.52983))
+    target_lat = parameters.get("target_lat")
+    target_lon = parameters.get("target_lon")
+    target_lat = float(target_lat) if target_lat not in (None, "") else None
+    target_lon = float(target_lon) if target_lon not in (None, "") else None
     return start_date, target_lat, target_lon
+
+
+def validate_runtime_aoi(aoi: object) -> dict:
+    """Validate a user-provided GeoJSON Polygon without geospatial dependencies."""
+    if not isinstance(aoi, dict) or aoi.get("type") != "Polygon":
+        raise RuntimeError("NISAR_GOFF_AOI_INVALID")
+    coordinates = aoi.get("coordinates")
+    if not isinstance(coordinates, list) or not coordinates or not isinstance(coordinates[0], list):
+        raise RuntimeError("NISAR_GOFF_AOI_INVALID")
+    ring = coordinates[0]
+    if len(ring) < 4 or ring[0] != ring[-1]:
+        raise RuntimeError("NISAR_GOFF_AOI_INVALID")
+    normalized_ring = []
+    for point in ring:
+        if not isinstance(point, list) or len(point) < 2:
+            raise RuntimeError("NISAR_GOFF_AOI_INVALID")
+        lon, lat = point[0], point[1]
+        if not isinstance(lon, (int, float)) or not isinstance(lat, (int, float)):
+            raise RuntimeError("NISAR_GOFF_AOI_INVALID")
+        if not math.isfinite(lon) or not math.isfinite(lat) or not -180 <= lon <= 180 or not -90 <= lat <= 90:
+            raise RuntimeError("NISAR_GOFF_AOI_INVALID")
+        normalized_ring.append([float(lon), float(lat)])
+    if len({tuple(point) for point in normalized_ring[:-1]}) < 3:
+        raise RuntimeError("NISAR_GOFF_AOI_INVALID")
+    area_twice = sum(
+        normalized_ring[index][0] * normalized_ring[index + 1][1]
+        - normalized_ring[index + 1][0] * normalized_ring[index][1]
+        for index in range(len(normalized_ring) - 1)
+    )
+    if abs(area_twice) < 1e-12:
+        raise RuntimeError("NISAR_GOFF_AOI_INVALID")
+    return {"type": "Polygon", "coordinates": [normalized_ring]}
+
+
+def runtime_aoi_context(parameters: dict, gunw_reader: object) -> dict:
+    """Set the pinned reader's AOI to the user polygon or explicit regression AOI."""
+    supplied_aoi = parameters.get("aoi")
+    regression_mode = parameters.get("regression_mode") is True
+    if supplied_aoi is None:
+        if not regression_mode:
+            raise RuntimeError("NISAR_GOFF_AOI_REQUIRED")
+        aoi_name = "source"
+        gunw_reader.set_aoi(aoi_name)
+        ring = [[float(lon), float(lat)] for lon, lat in gunw_reader.AOIS[aoi_name]]
+        aoi = {"type": "Polygon", "coordinates": [ring + [ring[0]]]}
+        mode = "langtang_regression"
+    else:
+        aoi = validate_runtime_aoi(supplied_aoi)
+        ring = aoi["coordinates"][0][:-1]
+        aoi_name = "runtime"
+        gunw_reader.AOIS[aoi_name] = [tuple(point) for point in ring]
+        gunw_reader.set_aoi(aoi_name)
+        mode = "user"
+    lons = [point[0] for point in ring]
+    lats = [point[1] for point in ring]
+    encoded = json.dumps(aoi, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {
+        "aoi": aoi,
+        "aoi_hash": hashlib.sha256(encoded).hexdigest(),
+        "aoi_mode": mode,
+        "bbox": (min(lons), min(lats), max(lons), max(lats)),
+        "centroid": {
+            "lon": math.fsum(lons) / len(lons),
+            "lat": math.fsum(lats) / len(lats),
+        },
+    }
+
+
+def resolve_target_coordinates(
+    spatial_context: dict, target_lat: float | None, target_lon: float | None
+) -> tuple[float, float]:
+    """Keep target coordinates optional for user AOIs and stable for regression."""
+    if target_lat is None:
+        target_lat = (
+            28.27799
+            if spatial_context["aoi_mode"] == "langtang_regression"
+            else spatial_context["centroid"]["lat"]
+        )
+    if target_lon is None:
+        target_lon = (
+            85.52983
+            if spatial_context["aoi_mode"] == "langtang_regression"
+            else spatial_context["centroid"]["lon"]
+        )
+    return target_lat, target_lon
 
 
 class StageFailure(Exception):
@@ -362,6 +451,26 @@ def choose_documented_stack(results):
     return chosen, []
 
 
+def choose_runtime_stack(results):
+    """Choose one preferred GOFF product per discovered pair for a user AOI."""
+    candidates = {}
+    for result in results:
+        item = parse_goff(safe_name(result), result)
+        if item is None:
+            continue
+        candidates.setdefault(edge_key(item), []).append(item)
+    selected = []
+    for edge in sorted(candidates, key=lambda value: (value[2], value[3], value[0], value[1])):
+        item = min(
+            candidates[edge],
+            key=lambda candidate: (0 if candidate["processing"] == "PR" else 1, candidate["name"]),
+        )
+        selected.append((item, "runtime-AOI preferred GOFF product"))
+    if not selected:
+        return None
+    return selected
+
+
 def grid_signature(grid):
     return (
         grid["height"], grid["width"], str(grid["transform"]),
@@ -416,13 +525,13 @@ def run_benchmark(science_root, output_dir, job_id, parameters):
     if actual_commit != EXPECTED_COMMIT:
         raise RuntimeError("science source revision mismatch")
 
-    set_aoi("source")
-    source_ring = gunw_reader.AOIS["source"]
-    lons = [point[0] for point in source_ring]
-    lats = [point[1] for point in source_ring]
-    bbox = (min(lons), min(lats), max(lons), max(lats))
+    spatial_context = runtime_aoi_context(parameters, gunw_reader)
+    bbox = spatial_context["bbox"]
+    target_lat, target_lon = resolve_target_coordinates(
+        spatial_context, target_lat, target_lon
+    )
 
-    END = datetime.now(timezone.utc).date().isoformat()
+    END = parameters.get("end_date") or datetime.now(timezone.utc).date().isoformat()
     raw_dir = Path(tempfile.mkdtemp(prefix="nisar-goff-benchmark-"))
     result_dir = Path(output_dir)
 
@@ -439,9 +548,13 @@ def run_benchmark(science_root, output_dir, job_id, parameters):
             results.extend(collection_results)
         print(f"GOFF_DISCOVERY_COUNT: {len(results)}")
 
-        selected_items, missing = choose_documented_stack(results)
+        if spatial_context["aoi_mode"] == "langtang_regression":
+            selected_items, missing = choose_documented_stack(results)
+        else:
+            selected_items, missing = choose_runtime_stack(results), []
         if selected_items is None:
-            print(f"GOFF_MISSING_EXPECTED_EDGES: {missing}")
+            if missing:
+                print(f"GOFF_MISSING_EXPECTED_EDGES: {missing}")
             fail("NISAR_GOFF_BENCHMARK_NETWORK_NOT_FOUND")
         print(f"GOFF_SELECTED_COUNT: {len(selected_items)}")
         for item, reason in selected_items:
@@ -593,7 +706,8 @@ def run_benchmark(science_root, output_dir, job_id, parameters):
             "science_commit": EXPECTED_COMMIT,
             "collections": list(COLLECTIONS),
             "reference_strategy": {
-                "aoi": "source",
+                "aoi": spatial_context["aoi_mode"],
+                "aoi_hash": spatial_context["aoi_hash"],
                 "target_lat": target_lat,
                 "target_lon": target_lon,
                 "target_radius_pixels": TARGET_RADIUS_PX,
@@ -609,7 +723,9 @@ def run_benchmark(science_root, output_dir, job_id, parameters):
                     "reference": str(item["ref"]),
                     "secondary": str(item["sec"]),
                     "span_days": item["span_days"],
-                    "selection_reason": "documented 16-product PR GOFF stack",
+                    "selection_reason": "documented 16-product PR GOFF stack"
+                    if spatial_context["aoi_mode"] == "langtang_regression"
+                    else "runtime-AOI preferred GOFF product",
                 }
             ],
             "read_records": [read_record],
@@ -640,6 +756,12 @@ def run_benchmark(science_root, output_dir, job_id, parameters):
             "cleanup_status": "success",
             "final_processing_status": "completed",
             "processing_parameters": {
+                "start_date": start_date,
+                "end_date": END,
+                "aoi": spatial_context["aoi"],
+                "aoi_hash": spatial_context["aoi_hash"],
+                "aoi_centroid": spatial_context["centroid"],
+                "aoi_mode": spatial_context["aoi_mode"],
                 "target_lat": target_lat,
                 "target_lon": target_lon,
                 "target_radius_pixels": TARGET_RADIUS_PX,
@@ -707,13 +829,13 @@ def run_full(science_root, output_dir, job_id, parameters):
     if actual_commit != EXPECTED_COMMIT:
         raise RuntimeError("science source revision mismatch")
 
-    set_aoi("source")
-    source_ring = gunw_reader.AOIS["source"]
-    lons = [point[0] for point in source_ring]
-    lats = [point[1] for point in source_ring]
-    bbox = (min(lons), min(lats), max(lons), max(lats))
+    spatial_context = runtime_aoi_context(parameters, gunw_reader)
+    bbox = spatial_context["bbox"]
+    target_lat, target_lon = resolve_target_coordinates(
+        spatial_context, target_lat, target_lon
+    )
 
-    END = datetime.now(timezone.utc).date().isoformat()
+    END = parameters.get("end_date") or datetime.now(timezone.utc).date().isoformat()
     raw_dir = Path(tempfile.mkdtemp(prefix="nisar-goff-full-"))
     result_dir = Path(output_dir)
     summary_path = result_dir / "result.json"
@@ -749,9 +871,13 @@ def run_full(science_root, output_dir, job_id, parameters):
         if not discovery_succeeded:
             raise RuntimeError("GOFF discovery did not complete")
         print(f"GOFF_DISCOVERY_COUNT: {len(results)}")
-        selected_items, missing = choose_documented_stack(results)
+        if spatial_context["aoi_mode"] == "langtang_regression":
+            selected_items, missing = choose_documented_stack(results)
+        else:
+            selected_items, missing = choose_runtime_stack(results), []
         if selected_items is None:
-            print(f"GOFF_MISSING_EXPECTED_EDGES: {missing}")
+            if missing:
+                print(f"GOFF_MISSING_EXPECTED_EDGES: {missing}")
             fail("NISAR_GOFF_FULL_NETWORK_NOT_FOUND")
         print(f"GOFF_SELECTED_COUNT: {len(selected_items)}")
         for item, reason in selected_items:
@@ -980,7 +1106,8 @@ def run_full(science_root, output_dir, job_id, parameters):
             "science_commit": EXPECTED_COMMIT,
             "collections": list(COLLECTIONS),
             "reference_strategy": {
-                "aoi": "source",
+                "aoi": spatial_context["aoi_mode"],
+                "aoi_hash": spatial_context["aoi_hash"],
                 "target_lat": target_lat,
                 "target_lon": target_lon,
                 "target_radius_pixels": TARGET_RADIUS_PX,
@@ -997,7 +1124,9 @@ def run_full(science_root, output_dir, job_id, parameters):
                     "reference": str(item["ref"]),
                     "secondary": str(item["sec"]),
                     "span_days": item["span_days"],
-                    "selection_reason": "documented 16-product PR GOFF stack",
+                    "selection_reason": "documented 16-product PR GOFF stack"
+                    if spatial_context["aoi_mode"] == "langtang_regression"
+                    else "runtime-AOI preferred GOFF product",
                 }
                 for item in selected_items
             ],
@@ -1071,6 +1200,11 @@ def run_full(science_root, output_dir, job_id, parameters):
             "final_processing_status": "completed",
             "processing_parameters": {
                 "start_date": start_date,
+                "end_date": END,
+                "aoi": spatial_context["aoi"],
+                "aoi_hash": spatial_context["aoi_hash"],
+                "aoi_centroid": spatial_context["centroid"],
+                "aoi_mode": spatial_context["aoi_mode"],
                 "target_lat": target_lat,
                 "target_lon": target_lon,
                 "target_radius_pixels": TARGET_RADIUS_PX,

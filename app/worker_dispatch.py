@@ -17,6 +17,41 @@ class DispatchError(RuntimeError):
         self.safe_message = safe_message
 
 
+def workflow_inputs(
+    job_id: str,
+    parameters: dict[str, Any],
+    benchmark_only: bool = False,
+) -> dict[str, str]:
+    """Build a safe workflow contract for either a user AOI or regression run."""
+    aoi = parameters.get("aoi")
+    regression_mode = parameters.get("regression_mode") is True
+    if aoi is None and not regression_mode:
+        raise DispatchError("DISPATCH_AOI_REQUIRED", "A user AOI is required for production science")
+    if aoi is not None and not isinstance(aoi, dict):
+        raise DispatchError("DISPATCH_AOI_INVALID", "User AOI must be a GeoJSON object")
+    try:
+        aoi_geojson = json.dumps(aoi, separators=(",", ":")) if aoi is not None else ""
+    except (TypeError, ValueError):
+        raise DispatchError("DISPATCH_AOI_INVALID", "User AOI must be valid JSON") from None
+    if len(aoi_geojson.encode("utf-8")) > 60_000:
+        raise DispatchError("DISPATCH_AOI_INVALID", "User AOI is too large for workflow dispatch")
+
+    def optional_input(name: str) -> str:
+        value = parameters.get(name)
+        return "" if value is None else str(value)
+
+    return {
+        "job_id": job_id,
+        "benchmark_only": str(benchmark_only).lower(),
+        "target_lat": optional_input("target_lat"),
+        "target_lon": optional_input("target_lon"),
+        "start_date": str(parameters.get("start_date", "2025-11-25")),
+        "end_date": optional_input("end_date"),
+        "aoi_geojson": aoi_geojson,
+        "regression_mode": str(regression_mode).lower(),
+    }
+
+
 def dispatch_to_github_actions(
     job_id: str,
     parameters: dict[str, Any],
@@ -38,13 +73,7 @@ def dispatch_to_github_actions(
             "GitHub token not configured for workflow dispatch",
         )
 
-    inputs = {
-        "job_id": job_id,
-        "benchmark_only": str(benchmark_only).lower(),
-        "target_lat": str(parameters.get("target_lat", 28.27799)),
-        "target_lon": str(parameters.get("target_lon", 85.52983)),
-        "start_date": str(parameters.get("start_date", "2025-11-25")),
-    }
+    inputs = workflow_inputs(job_id, parameters, benchmark_only)
 
     url = f"https://api.github.com/repos/{github_repository}/actions/workflows/{workflow_file}/dispatches"
     payload = {
@@ -107,16 +136,14 @@ def dispatch_via_gh_cli(
     workflow_file = "sarguardian-science-worker.yml"
     workflow_ref = settings.github_workflow_ref
 
+    inputs = workflow_inputs(job_id, parameters, benchmark_only)
     cmd = [
         "gh", "workflow", "run", workflow_file,
         "--repo", github_repository,
         "--ref", workflow_ref,
-        "-f", f"job_id={job_id}",
-        "-f", f"benchmark_only={str(benchmark_only).lower()}",
-        "-f", f"target_lat={parameters.get('target_lat', 28.27799)}",
-        "-f", f"target_lon={parameters.get('target_lon', 85.52983)}",
-        "-f", f"start_date={parameters.get('start_date', '2025-11-25')}",
     ]
+    for name, value in inputs.items():
+        cmd.extend(("-f", f"{name}={value}"))
 
     try:
         result = subprocess.run(
@@ -147,6 +174,9 @@ def dispatch_job(
     """
     Dispatch a job to GitHub Actions, trying API first then CLI.
     """
+    # Validate before choosing a transport so invalid production jobs never
+    # fall through to the CLI or start a runner.
+    workflow_inputs(job_id, parameters, benchmark_only)
     try:
         return dispatch_to_github_actions(job_id, parameters, benchmark_only)
     except DispatchError:

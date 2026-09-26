@@ -81,7 +81,7 @@ class RealDriveService:
             file_ids = json.loads(job.result_file_ids_json)
         except json.JSONDecodeError:
             raise DriveServiceError("DRIVE_RESULT_REFERENCES_INVALID", "Job result references are invalid") from None
-        if not isinstance(file_ids, dict) or set(file_ids) != set(EXPECTED_RESULT_FILES):
+        if not isinstance(file_ids, dict) or not set(EXPECTED_RESULT_FILES).issubset(file_ids):
             raise DriveServiceError("DRIVE_RESULT_REFERENCES_INVALID", "Job result references are invalid")
         try:
             return {

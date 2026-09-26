@@ -13,20 +13,35 @@ on:
         default: false
         type: boolean
       target_lat:
-        description: "Target latitude"
+        description: "Optional compatibility target latitude; user AOI centroid is used when empty"
         required: false
-        default: "28.27799"
+        default: ""
         type: string
       target_lon:
-        description: "Target longitude"
+        description: "Optional compatibility target longitude; user AOI centroid is used when empty"
         required: false
-        default: "85.52983"
+        default: ""
         type: string
       start_date:
         description: "Temporal start date (YYYY-MM-DD)"
         required: false
         default: "2025-11-25"
         type: string
+      end_date:
+        description: "Temporal end date (YYYY-MM-DD); empty means today"
+        required: false
+        default: ""
+        type: string
+      aoi_geojson:
+        description: "User AOI as a GeoJSON Polygon"
+        required: false
+        default: ""
+        type: string
+      regression_mode:
+        description: "Use the documented Langtang stack only for regression validation"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   sarguardian-science:
@@ -121,6 +136,9 @@ jobs:
           TARGET_LAT: ${{ inputs.target_lat }}
           TARGET_LON: ${{ inputs.target_lon }}
           START_DATE: ${{ inputs.start_date }}
+          END_DATE: ${{ inputs.end_date }}
+          AOI_GEOJSON: ${{ inputs.aoi_geojson }}
+          REGRESSION_MODE: ${{ inputs.regression_mode }}
         shell: bash
         run: |
           set -euo pipefail
@@ -130,19 +148,28 @@ jobs:
           import os
 
           parameters = {
-              "target_lat": os.environ["TARGET_LAT"],
-              "target_lon": os.environ["TARGET_LON"],
               "start_date": os.environ["START_DATE"],
+              "end_date": os.environ["END_DATE"] or None,
+              "regression_mode": os.environ["REGRESSION_MODE"].lower() == "true",
           }
+          if os.environ["TARGET_LAT"]:
+              parameters["target_lat"] = os.environ["TARGET_LAT"]
+          if os.environ["TARGET_LON"]:
+              parameters["target_lon"] = os.environ["TARGET_LON"]
+          aoi_geojson = os.environ["AOI_GEOJSON"]
+          if aoi_geojson:
+              parameters["aoi"] = json.loads(aoi_geojson)
           print(json.dumps(parameters, separators=(",", ":")))
           PY
           )"
 
           printf 'WORKER_PARAMETERS_JSON: %s\n' "$PARAMETERS_JSON"
 
+          WORK_OUTPUT_DIR="$(mktemp -d "${RUNNER_TEMP}/sarguardian-${JOB_ID}-XXXXXX")"
+          echo "SARGUARDIAN_WORK_OUTPUT_DIR=$WORK_OUTPUT_DIR" >> "$GITHUB_ENV"
           worker_args=(
             --job-id "$JOB_ID"
-            --output-dir "$PWD/result"
+            --output-dir "$WORK_OUTPUT_DIR/result"
             --science-root "$PWD/science-source"
             --parameters "$PARAMETERS_JSON"
           )
@@ -153,25 +180,23 @@ jobs:
 
           python scripts/sarguardian_worker.py "${worker_args[@]}"
           pwd
-          ls -lah result/
-          test -f result/result.json
-          test -f result/timeseries.csv
-          test -f result/manifest.json
+          ls -lah "$WORK_OUTPUT_DIR/result/"
+          test -f "$WORK_OUTPUT_DIR/result/result.json"
+          test -f "$WORK_OUTPUT_DIR/result/timeseries.csv"
+          test -f "$WORK_OUTPUT_DIR/result/manifest.json"
 
       - name: Complete worker-generated result package
         if: success()
         shell: bash
         run: |
           set -euo pipefail
-          : "${GITHUB_WORKSPACE:?GITHUB_WORKSPACE must be set}"
-          cd "$GITHUB_WORKSPACE"
-          pwd
-          ls -lah .
-          ls -lah result/
-          stat result/manifest.json
-          file result/manifest.json
-          test -f result/manifest.json
-          cat > result/README.txt <<'EOF'
+          : "${SARGUARDIAN_WORK_OUTPUT_DIR:?worker output directory must be set}"
+          result_dir="$SARGUARDIAN_WORK_OUTPUT_DIR/result"
+          ls -lah "$result_dir/"
+          stat "$result_dir/manifest.json"
+          file "$result_dir/manifest.json"
+          test -f "$result_dir/manifest.json"
+          cat > "$result_dir/README.txt" <<'EOF'
           SARGuardian GOFF time-series result
 
           This package contains the compact result of sequential GOFF processing.
@@ -186,10 +211,10 @@ jobs:
           manifest.json records provenance, selections, measurements, inversions, timings, and cleanup status.
           Raw NISAR HDF5 products are deleted immediately after derived processing and are not included in this package.
           EOF
-          test -f result/README.txt
-          test -f result/result.json
-          test -f result/timeseries.csv
-          test -f result/manifest.json
+          test -f "$result_dir/README.txt"
+          test -f "$result_dir/result.json"
+          test -f "$result_dir/timeseries.csv"
+          test -f "$result_dir/manifest.json"
 
       - name: Upload GOFF result package to Google Drive
         if: success()
@@ -198,12 +223,12 @@ jobs:
           GOOGLE_DRIVE_OAUTH_CLIENT_JSON: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_JSON }}
           GOOGLE_DRIVE_PARENT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_PARENT_FOLDER_ID }}
           GOOGLE_DRIVE_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_REFRESH_TOKEN }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
+          JOB_ID: ${{ inputs.job_id }}
         run: |
           set -euo pipefail
           echo "DRIVE_UPLOAD_COMMAND_STARTED"
           set +e
-          output=$(python scripts/upload_goff_result_to_drive.py)
+          output=$(python scripts/upload_goff_result_to_drive.py --result-directory "$SARGUARDIAN_WORK_OUTPUT_DIR/result")
           status=$?
           set -e
           printf '%s\n' "$output"
@@ -216,47 +241,63 @@ jobs:
           test -n "$folder_id"
           printf '%s' "$file_ids_json" | jq -e -c '
             type == "object"
-            and (keys | sort == ["README.txt", "manifest.json", "result.json", "timeseries.csv"])
+            and (keys as $keys | ["README.txt", "manifest.json", "metadata.json", "result.json", "timeseries.csv"] | all(.[]; . as $key | ($keys | index($key) != null)))
             and all(.[]; type == "string" and length > 0)
           ' > /dev/null
           echo "drive_folder_id=$folder_id" >> "$GITHUB_OUTPUT"
           echo "drive_file_ids=$(printf '%s' "$file_ids_json" | jq -c .)" >> "$GITHUB_OUTPUT"
 
+      - name: Remove temporary user science outputs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${SARGUARDIAN_WORK_OUTPUT_DIR:?worker output directory must be set}"
+          case "$SARGUARDIAN_WORK_OUTPUT_DIR" in
+            "$RUNNER_TEMP"/sarguardian-*) rm -rf -- "$SARGUARDIAN_WORK_OUTPUT_DIR" ;;
+            *) echo "Unexpected temporary output path" >&2; exit 1 ;;
+          esac
+
       - name: Callback Render with completion
         if: always()
         shell: bash
         run: |
+          set -euo pipefail
           if [ -n "${RENDER_CALLBACK_URL}" ] && [ -n "${WORKER_CALLBACK_SECRET}" ]; then
+            CALLBACK_ENDPOINT="${RENDER_CALLBACK_URL%/}/worker/callback/${{ inputs.job_id }}"
             STATUS="completed"
             if [ "${{ job.status }}" != "success" ]; then
               STATUS="failed"
             fi
             if [ "$STATUS" = "completed" ]; then
+              SCIENCE_COMMIT="$(git -C science-source rev-parse HEAD)"
               PAYLOAD=$(jq -cn \
                 --arg job_id "${{ inputs.job_id }}" \
                 --arg run_id "${{ github.run_id }}" \
                 --arg result_folder_id "${{ steps.drive_upload.outputs.drive_folder_id }}" \
                 --argjson result_file_ids '${{ steps.drive_upload.outputs.drive_file_ids }}' \
-                '{job_id: $job_id, status: "completed", run_id: $run_id, result_folder_id: $result_folder_id, result_file_ids: $result_file_ids}')
+                --arg science_commit "$SCIENCE_COMMIT" \
+                '{job_id: $job_id, status: "completed", run_id: $run_id, result_folder_id: $result_folder_id, result_file_ids: $result_file_ids, science_commit: $science_commit}')
             else
               PAYLOAD=$(jq -cn \
                 --arg job_id "${{ inputs.job_id }}" \
                 --arg run_id "${{ github.run_id }}" \
-                '{job_id: $job_id, status: "failed", run_id: $run_id}')
+                --arg error_code "GITHUB_ACTIONS_WORKER_FAILED" \
+                --arg error_message_safe "GitHub Actions science worker failed" \
+                '{job_id: $job_id, status: "failed", run_id: $run_id, error_code: $error_code, error_message_safe: $error_message_safe}')
             fi
-            curl -X POST "${RENDER_CALLBACK_URL}/worker/callback/${{ inputs.job_id }}" \
+            RESPONSE=$(curl --silent --show-error --fail-with-body --retry 3 --retry-delay 5 \
+              -X POST "$CALLBACK_ENDPOINT" \
               -H "Content-Type: application/json" \
               -H "Authorization: Bearer ${WORKER_CALLBACK_SECRET}" \
               -d "$PAYLOAD" \
-              --max-time 30 --retry 3 --retry-delay 5 || echo "Callback failed but continuing"
+              --max-time 30)
+            printf '%s' "$RESPONSE" | jq -e \
+              --arg job_id "${{ inputs.job_id }}" \
+              --arg status "$STATUS" \
+              'type == "object" and .status == "accepted" and .job_id == $job_id and .job_status == $status' \
+              > /dev/null
+            echo "WORKER_CALLBACK_ACCEPTED: status=$STATUS"
           else
             echo "Callback not configured, skipping"
           fi
-
-      - name: Upload result package as artifact (fallback)
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: sarguardian-goff-result-${{ github.run_id }}
-          path: result/
-          if-no-files-found: error

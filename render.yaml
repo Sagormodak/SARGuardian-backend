@@ -15,3 +15,5 @@ services:
         value: mock
       - key: DRIVE_MODE
         value: mock
+      - key: WORKER_CALLBACK_SECRET
+        sync: false
