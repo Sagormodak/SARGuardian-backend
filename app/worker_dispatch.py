@@ -30,6 +30,7 @@ def dispatch_to_github_actions(
     github_token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     github_repository = os.environ.get("GITHUB_REPOSITORY", "Sagormodak/SARGuardian-backend")
     workflow_file = "sarguardian-science-worker.yml"
+    workflow_ref = settings.github_workflow_ref
 
     if not github_token:
         raise DispatchError(
@@ -47,7 +48,7 @@ def dispatch_to_github_actions(
 
     url = f"https://api.github.com/repos/{github_repository}/actions/workflows/{workflow_file}/dispatches"
     payload = {
-        "ref": "main",
+        "ref": workflow_ref,
         "inputs": inputs,
     }
 
@@ -104,11 +105,12 @@ def dispatch_via_gh_cli(
     """
     github_repository = os.environ.get("GITHUB_REPOSITORY", "Sagormodak/SARGuardian-backend")
     workflow_file = "sarguardian-science-worker.yml"
+    workflow_ref = settings.github_workflow_ref
 
     cmd = [
         "gh", "workflow", "run", workflow_file,
         "--repo", github_repository,
-        "--ref", "main",
+        "--ref", workflow_ref,
         "-f", f"job_id={job_id}",
         "-f", f"benchmark_only={str(benchmark_only).lower()}",
         "-f", f"target_lat={parameters.get('target_lat', 28.27799)}",

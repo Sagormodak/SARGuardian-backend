@@ -22,6 +22,7 @@ class Settings:
     )
     drive_mode: str = os.getenv("DRIVE_MODE", "mock").lower()
     worker_callback_secret: str = os.getenv("WORKER_CALLBACK_SECRET", "")
+    github_workflow_ref: str = os.getenv("GITHUB_WORKFLOW_REF", "feat/real-goff-worker-14gb")
 
 
 settings = Settings()

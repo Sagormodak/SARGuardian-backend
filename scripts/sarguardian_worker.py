@@ -29,9 +29,6 @@ COLLECTIONS = (
     "NISAR_L2_GOFF_BETA_V1",
     "NISAR_L2_GOFF_PROVISIONAL_V1",
 )
-START = "2025-11-25"
-TARGET_LAT = 28.27799
-TARGET_LON = 85.52983
 TARGET_RADIUS_PX = 6
 BUFFER_KM = 2.0
 LOW_DISK_BYTES = 2 * 1024 ** 3
@@ -54,6 +51,14 @@ EXPECTED_EDGES = [
     ("A", 98, "20260726", "20260819"),
     ("D", 48, "20260816", "20260828"),
 ]
+
+
+def get_runtime_params(parameters: dict) -> tuple[str, float, float]:
+    """Extract runtime parameters with scientifically required defaults."""
+    start_date = parameters.get("start_date", "2025-11-25")
+    target_lat = float(parameters.get("target_lat", 28.27799))
+    target_lon = float(parameters.get("target_lon", 85.52983))
+    return start_date, target_lat, target_lon
 
 
 class StageFailure(Exception):
@@ -179,6 +184,8 @@ def run_benchmark(science_root, output_dir, job_id, parameters):
     print(f"JOB_ID: {job_id}")
     print(f"SCIENCE_COMMIT: {EXPECTED_COMMIT}")
 
+    start_date, target_lat, target_lon = get_runtime_params(parameters)
+
     sys.path.insert(0, str(science_root / "src"))
     import earthaccess
     from goff_reader import read_goff
@@ -208,7 +215,7 @@ def run_benchmark(science_root, output_dir, job_id, parameters):
         for collection in COLLECTIONS:
             collection_results = earthaccess.search_data(
                 short_name=collection,
-                temporal=(START, END),
+                temporal=(start_date, END),
                 bounding_box=bbox,
                 count=100,
             )
@@ -370,8 +377,8 @@ def run_benchmark(science_root, output_dir, job_id, parameters):
             "collections": list(COLLECTIONS),
             "reference_strategy": {
                 "aoi": "source",
-                "target_lat": TARGET_LAT,
-                "target_lon": TARGET_LON,
+                "target_lat": target_lat,
+                "target_lon": target_lon,
                 "target_radius_pixels": TARGET_RADIUS_PX,
                 "buffer_km": BUFFER_KM,
                 "engine": "goff_reader.read_goff",
@@ -420,8 +427,8 @@ def run_benchmark(science_root, output_dir, job_id, parameters):
             "cleanup_status": "success",
             "final_processing_status": "completed",
             "processing_parameters": {
-                "target_lat": TARGET_LAT,
-                "target_lon": TARGET_LON,
+                "target_lat": target_lat,
+                "target_lon": target_lon,
                 "target_radius_pixels": TARGET_RADIUS_PX,
                 "buffer_km": BUFFER_KM,
             },
@@ -460,6 +467,8 @@ def run_full(science_root, output_dir, job_id, parameters):
     print("NISAR_GOFF_FULL_START")
     print(f"JOB_ID: {job_id}")
     print(f"SCIENCE_COMMIT: {EXPECTED_COMMIT}")
+
+    start_date, target_lat, target_lon = get_runtime_params(parameters)
 
     sys.path.insert(0, str(science_root / "src"))
     import earthaccess
@@ -507,7 +516,7 @@ def run_full(science_root, output_dir, job_id, parameters):
                 for collection in COLLECTIONS:
                     collection_results = earthaccess.search_data(
                         short_name=collection,
-                        temporal=(START, END),
+                        temporal=(start_date, END),
                         bounding_box=bbox,
                         count=100,
                     )
@@ -687,7 +696,7 @@ def run_full(science_root, output_dir, job_id, parameters):
         print("GOFF_COMMON_REF_PROGRESS: starting")
         try:
             apply_common_datum(
-                pairs, lattices, TARGET_LAT, TARGET_LON,
+                pairs, lattices, target_lat, target_lon,
                 TARGET_RADIUS_PX, BUFFER_KM,
             )
             if any(pair.value is None for pair in pairs):
@@ -752,8 +761,8 @@ def run_full(science_root, output_dir, job_id, parameters):
             "collections": list(COLLECTIONS),
             "reference_strategy": {
                 "aoi": "source",
-                "target_lat": TARGET_LAT,
-                "target_lon": TARGET_LON,
+                "target_lat": target_lat,
+                "target_lon": target_lon,
                 "target_radius_pixels": TARGET_RADIUS_PX,
                 "buffer_km": BUFFER_KM,
                 "engine": "timeseries.apply_common_datum",

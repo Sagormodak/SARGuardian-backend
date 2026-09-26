@@ -46,6 +46,8 @@ jobs:
     steps:
       - name: Checkout SARGuardian backend
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
 
       - name: Checkout pinned SARGuardian science source
         uses: actions/checkout@v4
@@ -149,7 +151,7 @@ jobs:
               PAYLOAD="$PAYLOAD, \"result_file_ids\": ${{ steps.drive_upload.outputs.drive_file_ids }}"
             fi
             PAYLOAD="$PAYLOAD}"
-            curl -X POST "${RENDER_CALLBACK_URL}/jobs/${{ inputs.job_id }}/callback" \
+            curl -X POST "${RENDER_CALLBACK_URL}/worker/callback/${{ inputs.job_id }}" \
               -H "Content-Type: application/json" \
               -H "Authorization: Bearer ${WORKER_CALLBACK_SECRET}" \
               -d "$PAYLOAD" \
