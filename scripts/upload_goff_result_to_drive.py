@@ -32,6 +32,22 @@ class DriveUploadError(RuntimeError):
     """A deliberately non-sensitive Google Drive upload failure."""
 
 
+class DriveRequestError(DriveUploadError):
+    """A Drive request failure with optional safe HTTP status metadata."""
+
+    def __init__(self, http_status=None):
+        super().__init__("DRIVE_API_REQUEST_FAILED")
+        self.http_status = http_status
+
+
+class DriveFolderCreationError(DriveUploadError):
+    """A folder-creation failure retaining a safe, stage-specific diagnostic."""
+
+    def __init__(self, diagnostic):
+        super().__init__("DRIVE_FOLDER_CREATION_FAILED")
+        self.diagnostic = diagnostic
+
+
 def required_environment(name):
     value = os.environ.get(name, "").strip()
     if not value:
@@ -87,9 +103,12 @@ def request_json(request, retries=0):
             with urlopen(request, timeout=60) as response:
                 response_body = response.read()
             break
-        except (HTTPError, URLError, OSError, TimeoutError):
+        except HTTPError as exc:
             if attempt == retries:
-                raise DriveUploadError("DRIVE_API_REQUEST_FAILED") from None
+                raise DriveRequestError(http_status=exc.code) from None
+        except (URLError, OSError, TimeoutError):
+            if attempt == retries:
+                raise DriveRequestError() from None
 
     try:
         response_document = json.loads(response_body)
@@ -133,28 +152,49 @@ def drive_url(query):
     return f"{DRIVE_API_URL}?{urlencode(query)}"
 
 
+def folder_creation_diagnostic(stage, exc):
+    if isinstance(exc, DriveRequestError):
+        if exc.http_status is not None:
+            return f"{stage}: http_status={exc.http_status}"
+        return f"{stage}: network_or_timeout"
+    return f"{stage}: response_invalid"
+
+
 def create_run_folder(access_token, parent_folder_id, run_id):
-    parent = drive_request(
-        access_token,
-        f"{DRIVE_API_URL}/{parent_folder_id}?{urlencode({'fields': 'id,mimeType'})}",
-    )
+    try:
+        parent = drive_request(
+            access_token,
+            f"{DRIVE_API_URL}/{parent_folder_id}?{urlencode({'fields': 'id,mimeType'})}",
+        )
+    except DriveUploadError as exc:
+        raise DriveFolderCreationError(
+            folder_creation_diagnostic("DRIVE_PARENT_LOOKUP_FAILED", exc)
+        ) from None
+    print("DRIVE_PARENT_LOOKUP_SUCCEEDED")
     if parent.get("mimeType") != "application/vnd.google-apps.folder":
-        raise DriveUploadError("DRIVE_PARENT_FOLDER_INVALID")
+        raise DriveFolderCreationError("DRIVE_PARENT_FOLDER_INVALID")
+    print("DRIVE_PARENT_FOLDER_CONFIRMED")
     metadata = json.dumps({
         "name": run_id,
         "mimeType": "application/vnd.google-apps.folder",
         "parents": [parent_folder_id],
     }).encode("utf-8")
-    response = drive_request(
-        access_token,
-        f"{DRIVE_API_URL}?{urlencode({'supportsAllDrives': 'true', 'fields': 'id'})}",
-        method="POST",
-        data=metadata,
-        content_type="application/json; charset=UTF-8",
-    )
+    print("DRIVE_FOLDER_CREATE_REQUEST_STARTED")
+    try:
+        response = drive_request(
+            access_token,
+            f"{DRIVE_API_URL}?{urlencode({'supportsAllDrives': 'true', 'fields': 'id'})}",
+            method="POST",
+            data=metadata,
+            content_type="application/json; charset=UTF-8",
+        )
+    except DriveUploadError as exc:
+        raise DriveFolderCreationError(
+            folder_creation_diagnostic("DRIVE_FOLDER_CREATE_FAILED", exc)
+        ) from None
     folder_id = response.get("id")
     if not isinstance(folder_id, str) or not folder_id:
-        raise DriveUploadError("DRIVE_FOLDER_CREATION_FAILED")
+        raise DriveFolderCreationError("DRIVE_FOLDER_CREATE_FAILED: response_invalid")
     return folder_id
 
 
@@ -302,6 +342,10 @@ def main():
             folder_id = create_run_folder(
                 access_token, parent_folder_id, run_id
             )
+        except DriveFolderCreationError:
+            # Keep the specific, sanitized diagnostic for the outer handler,
+            # which also emits the established high-level failure marker.
+            raise
         except DriveUploadError:
             raise DriveUploadError("DRIVE_FOLDER_CREATION_FAILED") from None
         print(f"DRIVE_FOLDER_ID: {folder_id}")
@@ -330,6 +374,8 @@ def main():
         print("DRIVE_UPLOAD_VERIFIED")
         print(f"DRIVE_FILE_IDS_JSON: {serialized_file_ids(uploaded_file_ids)}")
     except DriveUploadError as exc:
+        if isinstance(exc, DriveFolderCreationError):
+            print(exc.diagnostic)
         print(str(exc))
         print("DRIVE_UPLOAD_FAILED")
         return 1

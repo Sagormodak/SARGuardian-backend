@@ -34,6 +34,104 @@ def test_drive_file_id_mapping_rejects_missing_or_empty_ids():
         drive_upload.serialized_file_ids(empty_id)
 
 
+@pytest.mark.parametrize("http_status", (400, 403, 404, 429, 500))
+def test_drive_folder_creation_reports_safe_parent_lookup_http_status(
+    monkeypatch, http_status
+):
+    def fail_parent_lookup(*_args, **_kwargs):
+        raise drive_upload.DriveRequestError(http_status=http_status)
+
+    monkeypatch.setattr(drive_upload, "drive_request", fail_parent_lookup)
+
+    with pytest.raises(drive_upload.DriveFolderCreationError) as exc_info:
+        drive_upload.create_run_folder("access-token", "parent-id", "run-id")
+
+    assert str(exc_info.value) == "DRIVE_FOLDER_CREATION_FAILED"
+    assert exc_info.value.diagnostic == (
+        f"DRIVE_PARENT_LOOKUP_FAILED: http_status={http_status}"
+    )
+
+
+def test_drive_folder_creation_reports_safe_parent_folder_validation(monkeypatch, capsys):
+    monkeypatch.setattr(
+        drive_upload,
+        "drive_request",
+        lambda *_args, **_kwargs: {"mimeType": "text/plain"},
+    )
+
+    with pytest.raises(drive_upload.DriveFolderCreationError) as exc_info:
+        drive_upload.create_run_folder("access-token", "parent-id", "run-id")
+
+    assert exc_info.value.diagnostic == "DRIVE_PARENT_FOLDER_INVALID"
+    assert "DRIVE_PARENT_LOOKUP_SUCCEEDED" in capsys.readouterr().out
+
+
+def test_drive_folder_creation_reports_safe_post_network_failure(monkeypatch, capsys):
+    calls = []
+
+    def drive_request(*_args, method="GET", **_kwargs):
+        calls.append(method)
+        if method == "GET":
+            return {"mimeType": "application/vnd.google-apps.folder"}
+        raise drive_upload.DriveRequestError()
+
+    monkeypatch.setattr(drive_upload, "drive_request", drive_request)
+
+    with pytest.raises(drive_upload.DriveFolderCreationError) as exc_info:
+        drive_upload.create_run_folder("access-token", "parent-id", "run-id")
+
+    assert exc_info.value.diagnostic == "DRIVE_FOLDER_CREATE_FAILED: network_or_timeout"
+    assert calls == ["GET", "POST"]
+    assert "DRIVE_PARENT_FOLDER_CONFIRMED" in capsys.readouterr().out
+
+
+def test_drive_folder_creation_reports_safe_post_http_status(monkeypatch, capsys):
+    def drive_request(*_args, method="GET", **_kwargs):
+        if method == "GET":
+            return {"mimeType": "application/vnd.google-apps.folder"}
+        raise drive_upload.DriveRequestError(http_status=403)
+
+    monkeypatch.setattr(drive_upload, "drive_request", drive_request)
+
+    with pytest.raises(drive_upload.DriveFolderCreationError) as exc_info:
+        drive_upload.create_run_folder("access-token", "parent-id", "run-id")
+
+    assert exc_info.value.diagnostic == "DRIVE_FOLDER_CREATE_FAILED: http_status=403"
+    output = capsys.readouterr().out
+    assert "DRIVE_PARENT_LOOKUP_SUCCEEDED" in output
+    assert "DRIVE_PARENT_FOLDER_CONFIRMED" in output
+    assert "DRIVE_FOLDER_CREATE_REQUEST_STARTED" in output
+
+
+def test_main_preserves_safe_folder_creation_diagnostic(monkeypatch, capsys):
+    def fail_folder_creation(*_args):
+        raise drive_upload.DriveFolderCreationError(
+            "DRIVE_FOLDER_CREATE_FAILED: http_status=403"
+        )
+
+    monkeypatch.setattr(drive_upload, "required_environment", lambda _name: "value")
+    monkeypatch.setattr(
+        drive_upload, "parse_client_configuration", lambda _value: ("client-id", "secret")
+    )
+    monkeypatch.setattr(drive_upload, "parse_refresh_token", lambda _value: "refresh")
+    monkeypatch.setattr(drive_upload, "result_files", lambda _path: [])
+    monkeypatch.setattr(drive_upload, "verify_result_manifest", lambda _path: None)
+    monkeypatch.setattr(drive_upload, "refresh_access_token", lambda *_args: "access")
+    monkeypatch.setattr(drive_upload, "verify_authenticated_account", lambda _token: None)
+    monkeypatch.setattr(
+        drive_upload,
+        "create_run_folder",
+        fail_folder_creation,
+    )
+
+    assert drive_upload.main() == 1
+
+    output = capsys.readouterr().out
+    assert "DRIVE_FOLDER_CREATE_FAILED: http_status=403" in output
+    assert "DRIVE_FOLDER_CREATION_FAILED" in output
+    assert "DRIVE_UPLOAD_FAILED" in output
+
+
 def test_drive_validator_requires_the_worker_manifest_not_result_json(tmp_path):
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(
