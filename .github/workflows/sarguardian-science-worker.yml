@@ -157,7 +157,6 @@ jobs:
           test -f result/result.json
           test -f result/timeseries.csv
           test -f result/manifest.json
-          test -f result/README.txt
 
       - name: Complete worker-generated result package
         if: success()
@@ -187,6 +186,10 @@ jobs:
           manifest.json records provenance, selections, measurements, inversions, timings, and cleanup status.
           Raw NISAR HDF5 products are deleted immediately after derived processing and are not included in this package.
           EOF
+          test -f result/README.txt
+          test -f result/result.json
+          test -f result/timeseries.csv
+          test -f result/manifest.json
 
       - name: Upload GOFF result package to Google Drive
         if: success()

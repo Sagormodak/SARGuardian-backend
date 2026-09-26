@@ -217,13 +217,24 @@ def test_worker_workflow_checks_the_dispatch_revision_and_result_files():
         "ls -lah result/",
         "stat result/manifest.json",
         "file result/manifest.json",
-        "test -f result/result.json",
-        "test -f result/timeseries.csv",
-        "test -f result/manifest.json",
-        "test -f result/README.txt",
     ):
         assert command in workflow
     assert 'cd "$GITHUB_WORKSPACE"' in workflow
+
+    worker_step = workflow.split("      - name: Complete worker-generated result package")[0]
+    package_step = workflow.split("      - name: Complete worker-generated result package", 1)[1].split(
+        "      - name: Upload GOFF result package to Google Drive", 1
+    )[0]
+
+    for command in (
+        "test -f result/result.json",
+        "test -f result/timeseries.csv",
+        "test -f result/manifest.json",
+    ):
+        assert command in worker_step
+        assert command in package_step
+    assert "test -f result/README.txt" not in worker_step
+    assert "test -f result/README.txt" in package_step
 
 
 def test_worker_writes_a_detailed_manifest_in_benchmark_and_full_modes():
