@@ -32,6 +32,12 @@ COLLECTIONS = (
 TARGET_RADIUS_PX = 6
 BUFFER_KM = 2.0
 LOW_DISK_BYTES = 2 * 1024 ** 3
+EXPECTED_RESULT_FILES = (
+    "result.json",
+    "timeseries.csv",
+    "manifest.json",
+    "README.txt",
+)
 
 EXPECTED_EDGES = [
     ("D", 48, "20251125", "20251207"),
@@ -176,6 +182,31 @@ def grid_signature(grid):
         float(grid["res_x"]), float(grid["res_y"]),
         tuple(grid["rows"].tolist()), tuple(grid["cols"].tolist()),
     )
+
+
+def write_result_package_atomically(result_dir, package_files):
+    """Publish a complete compact result package with a single rename."""
+    if set(package_files) != set(EXPECTED_RESULT_FILES):
+        raise RuntimeError("RESULT_PACKAGE_INVALID")
+    if result_dir.exists():
+        raise RuntimeError("RESULT_PACKAGE_OUTPUT_EXISTS")
+
+    result_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = Path(tempfile.mkdtemp(
+        prefix=f".{result_dir.name}-", dir=result_dir.parent
+    ))
+    try:
+        for name in EXPECTED_RESULT_FILES:
+            content = package_files[name]
+            if not isinstance(content, str):
+                raise RuntimeError("RESULT_PACKAGE_INVALID")
+            (staging_dir / name).write_text(content, encoding="utf-8")
+        if {path.name for path in staging_dir.iterdir()} != set(EXPECTED_RESULT_FILES):
+            raise RuntimeError("RESULT_PACKAGE_INVALID")
+        staging_dir.replace(result_dir)
+    except Exception:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
 
 
 def run_benchmark(science_root, output_dir, job_id, parameters):
@@ -401,15 +432,6 @@ def run_benchmark(science_root, output_dir, job_id, parameters):
             "overall_success": True,
         }
 
-        result_dir.mkdir(parents=True, exist_ok=True)
-        (result_dir / "result.json").write_text(
-            json.dumps(summary, indent=2) + "\n", encoding="utf-8"
-        )
-        (result_dir / "timeseries.csv").write_text(
-            "geometry,component,epoch,cumulative_mm\n"
-            f"BENCHMARK,1,{item['ref']},0.0\n",
-            encoding="utf-8",
-        )
         manifest = {
             "job_id": job_id,
             "science_mode": "benchmark",
@@ -438,18 +460,25 @@ def run_benchmark(science_root, output_dir, job_id, parameters):
                 "buffer_km": BUFFER_KM,
             },
         }
-        (result_dir / "manifest.json").write_text(
-            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-        )
-        (result_dir / "README.txt").write_text(
-            "SARGuardian GOFF benchmark result.\n"
-            f"Science commit: {EXPECTED_COMMIT}\n"
-            f"Job ID: {job_id}\n"
-            "Processed one GOFF product to verify Earthdata auth, download, "
-            "GOFF layer2 reading, AOI clipping, derived state generation, "
-            "raw .h5 deletion, disk recovery, memory measurement, timing measurement, "
-            "and compact result creation.\n",
-            encoding="utf-8",
+        write_result_package_atomically(
+            result_dir,
+            {
+                "result.json": json.dumps(summary, indent=2) + "\n",
+                "timeseries.csv": (
+                    "geometry,component,epoch,cumulative_mm\n"
+                    f"BENCHMARK,1,{item['ref']},0.0\n"
+                ),
+                "manifest.json": json.dumps(manifest, indent=2) + "\n",
+                "README.txt": (
+                    "SARGuardian GOFF benchmark result.\n"
+                    f"Science commit: {EXPECTED_COMMIT}\n"
+                    f"Job ID: {job_id}\n"
+                    "Processed one GOFF product to verify Earthdata auth, download, "
+                    "GOFF layer2 reading, AOI clipping, derived state generation, "
+                    "raw .h5 deletion, disk recovery, memory measurement, timing measurement, "
+                    "and compact result creation.\n"
+                ),
+            },
         )
 
         print("NISAR_GOFF_BENCHMARK_SUCCESS")

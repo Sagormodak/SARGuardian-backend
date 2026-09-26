@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from scripts import upload_goff_result_to_drive as drive_upload
+from scripts import sarguardian_worker
 
 
 def test_drive_file_id_mapping_has_the_exact_result_package_names():
@@ -102,11 +103,49 @@ def test_worker_workflow_builds_parameters_after_step_env_is_available():
     assert 'worker_args+=(--benchmark-only)' in workflow
 
 
+def test_worker_workflow_checks_the_dispatch_revision_and_result_files():
+    workflow = (
+        Path(__file__).parents[1]
+        / ".github"
+        / "workflows"
+        / "sarguardian-science-worker.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "ref: ${{ github.sha }}" in workflow
+    assert "run: git rev-parse HEAD" in workflow
+    for command in (
+        "pwd",
+        "ls -lah result/",
+        "test -f result/result.json",
+        "test -f result/timeseries.csv",
+        "test -f result/manifest.json",
+        "test -f result/README.txt",
+    ):
+        assert command in workflow
+
+
 def test_worker_writes_a_detailed_manifest_in_benchmark_and_full_modes():
     worker = (Path(__file__).parents[1] / "scripts" / "sarguardian_worker.py").read_text(
         encoding="utf-8"
     )
 
-    assert worker.count('(result_dir / "manifest.json").write_text') == 2
+    assert worker.count("write_result_package_atomically(") == 2
+    assert worker.count('(result_dir / "manifest.json").write_text') == 1
     assert worker.count('"cleanup_status": "success"') == 2
     assert worker.count('"final_processing_status": "completed"') == 2
+
+
+def test_atomic_result_package_publish_requires_exact_four_files(tmp_path):
+    result_directory = tmp_path / "result"
+    package = {
+        name: f"contents for {name}\n"
+        for name in sarguardian_worker.EXPECTED_RESULT_FILES
+    }
+
+    sarguardian_worker.write_result_package_atomically(result_directory, package)
+
+    assert {path.name for path in result_directory.iterdir()} == set(package)
+    assert all((result_directory / name).read_text(encoding="utf-8") == content
+               for name, content in package.items())
+    with pytest.raises(RuntimeError, match="RESULT_PACKAGE_OUTPUT_EXISTS"):
+        sarguardian_worker.write_result_package_atomically(result_directory, package)

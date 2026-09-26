@@ -47,7 +47,11 @@ jobs:
       - name: Checkout SARGuardian backend
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
+
+      - name: Verify backend revision
+        shell: bash
+        run: git rev-parse HEAD
 
       - name: Checkout pinned SARGuardian science source
         uses: actions/checkout@v4
@@ -112,6 +116,12 @@ jobs:
           fi
 
           python scripts/sarguardian_worker.py "${worker_args[@]}"
+          pwd
+          ls -lah result/
+          test -f result/result.json
+          test -f result/timeseries.csv
+          test -f result/manifest.json
+          test -f result/README.txt
 
       - name: Complete worker-generated result package
         if: success()
