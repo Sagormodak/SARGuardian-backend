@@ -12,8 +12,10 @@ services:
       - key: APP_SECRET_KEY
         sync: false
       - key: SCIENCE_MODE
-        value: mock
+        value: github_actions
       - key: DRIVE_MODE
-        value: mock
+        value: real
+      - key: GITHUB_WORKFLOW_REF
+        value: feat/real-goff-worker-14gb
       - key: WORKER_CALLBACK_SECRET
         sync: false
