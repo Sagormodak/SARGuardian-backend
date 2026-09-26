@@ -83,6 +83,25 @@ def test_worker_workflow_uses_the_verified_filename_id_mapping():
     assert "result_file_ids: $result_file_ids" in workflow
 
 
+def test_worker_workflow_builds_parameters_after_step_env_is_available():
+    workflow = (
+        Path(__file__).parents[1]
+        / ".github"
+        / "workflows"
+        / "sarguardian-science-worker.yml"
+    ).read_text(encoding="utf-8")
+
+    for name in ("JOB_ID", "TARGET_LAT", "TARGET_LON", "START_DATE", "BENCHMARK_ONLY"):
+        assert f"{name}: ${{{{ inputs." in workflow
+    assert 'PARAMETERS_JSON="$(' in workflow
+    assert 'os.environ["TARGET_LAT"]' in workflow
+    assert 'os.environ["TARGET_LON"]' in workflow
+    assert 'os.environ["START_DATE"]' in workflow
+    assert 'json.dumps(parameters, separators=(",", ":"))' in workflow
+    assert '--parameters "$PARAMETERS_JSON"' in workflow
+    assert 'worker_args+=(--benchmark-only)' in workflow
+
+
 def test_worker_writes_a_detailed_manifest_in_benchmark_and_full_modes():
     worker = (Path(__file__).parents[1] / "scripts" / "sarguardian_worker.py").read_text(
         encoding="utf-8"

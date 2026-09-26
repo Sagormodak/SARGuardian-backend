@@ -76,22 +76,42 @@ jobs:
       - name: Run SARGuardian GOFF worker
         id: worker
         env:
+          JOB_ID: ${{ inputs.job_id }}
           BENCHMARK_ONLY: ${{ inputs.benchmark_only }}
           TARGET_LAT: ${{ inputs.target_lat }}
           TARGET_LON: ${{ inputs.target_lon }}
           START_DATE: ${{ inputs.start_date }}
+        shell: bash
         run: |
-          SCIENCE_ROOT="$PWD/science-source" \
-          OUTPUT_DIR="$PWD/result" \
-          JOB_ID="${{ inputs.job_id }}" \
-          BENCHMARK_ONLY="${{ inputs.benchmark_only }}" \
-          PARAMETERS_JSON="{\"target_lat\":${{ inputs.target_lat }},\"target_lon\":${{ inputs.target_lon }},\"start_date\":\"${{ inputs.start_date }}\"}" \
-          python scripts/sarguardian_worker.py \
-            --job-id "${{ inputs.job_id }}" \
-            --output-dir "$PWD/result" \
-            --science-root "$PWD/science-source" \
-            ${{ inputs.benchmark_only && '--benchmark-only' || '' }} \
+          set -euo pipefail
+          PARAMETERS_JSON="$(
+          python - <<'PY'
+          import json
+          import os
+
+          parameters = {
+              "target_lat": os.environ["TARGET_LAT"],
+              "target_lon": os.environ["TARGET_LON"],
+              "start_date": os.environ["START_DATE"],
+          }
+          print(json.dumps(parameters, separators=(",", ":")))
+          PY
+          )"
+
+          printf 'WORKER_PARAMETERS_JSON: %s\n' "$PARAMETERS_JSON"
+
+          worker_args=(
+            --job-id "$JOB_ID"
+            --output-dir "$PWD/result"
+            --science-root "$PWD/science-source"
             --parameters "$PARAMETERS_JSON"
+          )
+
+          if [ "$BENCHMARK_ONLY" = "true" ]; then
+            worker_args+=(--benchmark-only)
+          fi
+
+          python scripts/sarguardian_worker.py "${worker_args[@]}"
 
       - name: Complete worker-generated result package
         if: success()
