@@ -77,6 +77,42 @@ jobs:
           python -m pip install --no-cache-dir --requirement science-source/requirements.txt
           python -m pip install --no-cache-dir --upgrade earthaccess
 
+      - name: Temporary Earthdata network diagnostics
+        shell: bash
+        run: |
+          echo "EARTHDATA_NETWORK_DIAGNOSTICS_START" || true
+          hostname || true
+          for name in RUNNER_NAME RUNNER_OS RUNNER_ARCH RUNNER_ENVIRONMENT RUNNER_REGION AZURE_REGION AZURE_LOCATION ImageOS ImageVersion GITHUB_RUN_ID GITHUB_RUN_ATTEMPT GITHUB_JOB GITHUB_WORKFLOW GITHUB_REF GITHUB_SHA; do
+            printf 'RUNNER_METADATA: %s=%s\n' "$name" "${!name-<unset>}" || true
+          done
+          echo "RESOLV_CONF_START" || true
+          cat /etc/resolv.conf || true
+          echo "RESOLV_CONF_END" || true
+          getent hosts urs.earthdata.nasa.gov || true
+          getent ahostsv4 urs.earthdata.nasa.gov || true
+          getent ahostsv6 urs.earthdata.nasa.gov || true
+          python -c 'import socket; print(socket.getaddrinfo("urs.earthdata.nasa.gov", 443, type=socket.SOCK_STREAM))' || true
+          for host in github.com pypi.org google.com; do
+            echo "CONTROL_DNS_HOST: $host" || true
+            getent hosts "$host" || true
+            python -c 'import socket, sys; print(socket.getaddrinfo(sys.argv[1], 443, type=socket.SOCK_STREAM))' "$host" || true
+          done
+          curl -4 -I --connect-timeout 10 --max-time 15 https://urs.earthdata.nasa.gov/ || true
+          curl -6 -I --connect-timeout 10 --max-time 15 https://urs.earthdata.nasa.gov/ || true
+          if command -v nslookup >/dev/null 2>&1; then
+            nslookup urs.earthdata.nasa.gov || true
+          else
+            echo "NSLOOKUP_UNAVAILABLE" || true
+          fi
+          if command -v dig >/dev/null 2>&1; then
+            dig urs.earthdata.nasa.gov || true
+            dig @1.1.1.1 urs.earthdata.nasa.gov || true
+            dig @8.8.8.8 urs.earthdata.nasa.gov || true
+          else
+            echo "DIG_UNAVAILABLE" || true
+          fi
+          echo "EARTHDATA_NETWORK_DIAGNOSTICS_COMPLETE" || true
+
       - name: Run SARGuardian GOFF worker
         id: worker
         env:
