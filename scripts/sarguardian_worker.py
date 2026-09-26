@@ -13,10 +13,14 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
@@ -32,6 +36,11 @@ COLLECTIONS = (
 TARGET_RADIUS_PX = 6
 BUFFER_KM = 2.0
 LOW_DISK_BYTES = 2 * 1024 ** 3
+EARTHDATA_URS_HOST = "urs.earthdata.nasa.gov"
+EARTHDATA_URS_URL = f"https://{EARTHDATA_URS_HOST}/"
+EARTHDATA_PREFLIGHT_DELAYS = (2, 5)
+EARTHDATA_LOGIN_DELAYS = (5, 15, 30)
+EARTHDATA_PREFLIGHT_TIMEOUT_SECONDS = 5
 EXPECTED_RESULT_FILES = (
     "result.json",
     "timeseries.csv",
@@ -71,8 +80,185 @@ class StageFailure(Exception):
     pass
 
 
+class EarthdataLoginError(RuntimeError):
+    """A safe, non-sensitive failure returned by Earthdata authentication."""
+
+
 def fail(marker):
     raise StageFailure(marker)
+
+
+def _exception_chain(error):
+    """Yield an exception and its causes without formatting them for logs."""
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        yield error
+        error = error.__cause__ or error.__context__
+
+
+def classify_earthdata_error(error):
+    """Classify errors without ever returning their potentially sensitive text."""
+    errors = list(_exception_chain(error))
+
+    for item in errors:
+        for attribute in ("status_code", "status", "code"):
+            status = getattr(item, attribute, None)
+            if status in (401, 403):
+                return "authentication"
+
+    details = " ".join(
+        f"{type(item).__module__}.{type(item).__name__} {item}".lower()
+        for item in errors
+    )
+    if any(marker in details for marker in (
+        "unauthorized", "forbidden", "authentication failed",
+        "invalid credential", "invalid username", "invalid password",
+    )):
+        return "authentication"
+    if any(marker in details for marker in (
+        "readtimeout", "connecttimeout", "timeout", "timed out",
+        "gateway timeout",
+    )):
+        return "timeout"
+    if any(marker in details for marker in (
+        "gaierror", "nameresolutionerror", "name or service not known",
+        "temporary failure in name resolution", "dns",
+    )):
+        return "dns"
+    if any(marker in details for marker in (
+        "connectionerror", "newconnectionerror", "network is unreachable",
+        "connection refused", "connection reset", "sslerror", "urlerror",
+    )):
+        return "network"
+    for item in errors:
+        for attribute in ("status_code", "status", "code"):
+            status = getattr(item, attribute, None)
+            if status in (408, 429) or isinstance(status, int) and status >= 500:
+                return "timeout"
+    return "unknown"
+
+
+def _earthdata_error_code(kind):
+    return {
+        "authentication": "NISAR_GOFF_EARTHDATA_AUTH_FAILED",
+        "timeout": "NISAR_GOFF_EARTHDATA_SERVICE_TIMEOUT",
+        "dns": "NISAR_GOFF_EARTHDATA_NETWORK_UNAVAILABLE",
+        "network": "NISAR_GOFF_EARTHDATA_NETWORK_UNAVAILABLE",
+    }.get(kind, "NISAR_GOFF_EARTHDATA_LOGIN_FAILED")
+
+
+def _retry_delay(delays, attempt):
+    return delays[attempt - 1] if attempt <= len(delays) else None
+
+
+def preflight_earthdata_endpoint(
+    *,
+    resolver=None,
+    opener=None,
+    sleep_fn=None,
+    delays=EARTHDATA_PREFLIGHT_DELAYS,
+):
+    """Check DNS and HTTPS reachability before credentials are submitted."""
+    resolver = resolver or socket.getaddrinfo
+    opener = opener or urlopen
+    sleep_fn = sleep_fn or time.sleep
+    attempts = len(delays) + 1
+    last_kind = "unknown"
+
+    for attempt in range(1, attempts + 1):
+        print(f"EARTHDATA_PREFLIGHT_ATTEMPT: {attempt}/{attempts}")
+        try:
+            resolver(EARTHDATA_URS_HOST, 443, type=socket.SOCK_STREAM)
+        except OSError as error:
+            last_kind = "dns" if classify_earthdata_error(error) == "dns" else "network"
+            print(f"EARTHDATA_PREFLIGHT_DNS_NETWORK_UNAVAILABLE: attempt={attempt}")
+        else:
+            try:
+                response = opener(
+                    Request(EARTHDATA_URS_URL, method="HEAD"),
+                    timeout=EARTHDATA_PREFLIGHT_TIMEOUT_SECONDS,
+                )
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
+                print(f"EARTHDATA_PREFLIGHT_ENDPOINT_REACHABLE: attempt={attempt}")
+                return
+            except HTTPError:
+                # A HTTP response, including 401/403, proves the endpoint is reachable.
+                print(f"EARTHDATA_PREFLIGHT_ENDPOINT_REACHABLE: attempt={attempt}")
+                return
+            except Exception as error:
+                last_kind = classify_earthdata_error(error)
+                if last_kind == "timeout":
+                    print(f"EARTHDATA_PREFLIGHT_SERVICE_TIMEOUT: attempt={attempt}")
+                elif last_kind in ("dns", "network"):
+                    print(f"EARTHDATA_PREFLIGHT_DNS_NETWORK_UNAVAILABLE: attempt={attempt}")
+                else:
+                    print(f"EARTHDATA_PREFLIGHT_FAILED: attempt={attempt}")
+
+        delay = _retry_delay(delays, attempt)
+        if delay is not None:
+            print(
+                "EARTHDATA_PREFLIGHT_RETRYING: "
+                f"next_attempt={attempt + 1} delay_seconds={delay}"
+            )
+            sleep_fn(delay)
+
+    raise EarthdataLoginError(_earthdata_error_code(last_kind))
+
+
+def login_earthdata_with_retry(
+    earthaccess_module,
+    *,
+    preflight=None,
+    sleep_fn=None,
+    delays=EARTHDATA_LOGIN_DELAYS,
+):
+    """Authenticate once through Earthaccess and retain its module session.
+
+    Earthaccess owns the environment credential lookup and its authenticated
+    session.  Callers continue to use the same module for discovery/downloads.
+    """
+    preflight = preflight or preflight_earthdata_endpoint
+    sleep_fn = sleep_fn or time.sleep
+    preflight()
+    attempts = len(delays) + 1
+
+    for attempt in range(1, attempts + 1):
+        print(f"EARTHDATA_LOGIN_ATTEMPT: {attempt}/{attempts}")
+        try:
+            auth = earthaccess_module.login(strategy="environment")
+        except Exception as error:
+            kind = classify_earthdata_error(error)
+            if kind == "authentication":
+                print(f"EARTHDATA_LOGIN_AUTH_REJECTED: attempt={attempt}")
+                raise EarthdataLoginError(_earthdata_error_code(kind)) from None
+            if kind == "timeout":
+                print(f"EARTHDATA_LOGIN_SERVICE_TIMEOUT: attempt={attempt}")
+            elif kind in ("dns", "network"):
+                print(f"EARTHDATA_LOGIN_DNS_NETWORK_UNAVAILABLE: attempt={attempt}")
+            else:
+                print(f"EARTHDATA_LOGIN_FAILED: attempt={attempt}")
+                raise EarthdataLoginError(_earthdata_error_code(kind)) from None
+        else:
+            if auth is not None and auth is not False:
+                print(f"EARTHDATA_AUTH_SUCCESS: attempt={attempt}")
+                return auth
+            print(f"EARTHDATA_LOGIN_AUTH_REJECTED: attempt={attempt}")
+            raise EarthdataLoginError(
+                "NISAR_GOFF_EARTHDATA_AUTH_FAILED"
+            )
+
+        delay = _retry_delay(delays, attempt)
+        if delay is not None:
+            print(
+                "EARTHDATA_LOGIN_RETRYING: "
+                f"next_attempt={attempt + 1} delay_seconds={delay}"
+            )
+            sleep_fn(delay)
+
+    raise EarthdataLoginError("NISAR_GOFF_EARTHDATA_SERVICE_TIMEOUT")
 
 
 def disk_snapshot(label):
@@ -241,7 +427,7 @@ def run_benchmark(science_root, output_dir, job_id, parameters):
     result_dir = Path(output_dir)
 
     try:
-        earthaccess.login(strategy="environment")
+        login_earthdata_with_retry(earthaccess)
         results = []
         for collection in COLLECTIONS:
             collection_results = earthaccess.search_data(
@@ -542,7 +728,7 @@ def run_full(science_root, output_dir, job_id, parameters):
     selected_items = []
 
     try:
-        earthaccess.login(strategy="environment")
+        login_earthdata_with_retry(earthaccess)
         discovery_succeeded = False
         for _attempt in range(3):
             try:
