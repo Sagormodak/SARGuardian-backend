@@ -162,8 +162,16 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
+          echo "DRIVE_UPLOAD_COMMAND_STARTED"
+          set +e
           output=$(python scripts/upload_goff_result_to_drive.py)
-          echo "$output"
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          echo "DRIVE_UPLOAD_EXIT_STATUS: $status"
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
           folder_id=$(printf '%s\n' "$output" | sed -n 's/^DRIVE_FOLDER_ID: //p' | tail -n 1)
           file_ids_json=$(printf '%s\n' "$output" | sed -n 's/^DRIVE_FILE_IDS_JSON: //p' | tail -n 1)
           test -n "$folder_id"
