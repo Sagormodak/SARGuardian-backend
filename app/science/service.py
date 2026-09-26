@@ -12,6 +12,7 @@ from app.science.result_package import (
     prepare_result_directory,
     validate_result_package,
 )
+from app.worker_dispatch import DispatchError, dispatch_job
 
 
 class ScienceExecutionError(RuntimeError):
@@ -25,7 +26,7 @@ class ScienceExecutionError(RuntimeError):
 
 @dataclass(frozen=True)
 class ScienceResult:
-    package: ResultPackage
+    package: ResultPackage | None
     metadata: dict[str, Any]
 
 
@@ -133,6 +134,26 @@ class RealScienceService:
         )
 
 
+class GitHubActionsScienceService:
+    """Dispatches science execution to GitHub Actions workflow."""
+
+    def run(self, job_id: str, parameters: dict[str, Any]) -> ScienceResult:
+        benchmark_only = parameters.get("benchmark_only", False)
+        try:
+            run_id = dispatch_job(job_id, parameters, benchmark_only)
+        except DispatchError as exc:
+            raise ScienceExecutionError(exc.code, exc.safe_message) from exc
+        return ScienceResult(
+            package=None,
+            metadata={
+                "science_mode": "github_actions",
+                "dispatched": True,
+                "run_id": run_id,
+                "benchmark_only": benchmark_only,
+            },
+        )
+
+
 def _safe_process_environment() -> dict[str, str]:
     import os
 
@@ -144,4 +165,6 @@ def build_science_service() -> ScienceService:
         return MockScienceService()
     if settings.science_mode == "real":
         return RealScienceService()
+    if settings.science_mode == "github_actions":
+        return GitHubActionsScienceService()
     raise ScienceExecutionError("SCIENCE_MODE_INVALID", "Science mode is invalid")

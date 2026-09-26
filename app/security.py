@@ -61,3 +61,7 @@ def sanitize_metadata(value):
     if isinstance(value, list):
         return [sanitize_metadata(item) for item in value]
     return value
+
+
+def constant_time_compare(left: str, right: str) -> bool:
+    return hmac.compare_digest(left, right)

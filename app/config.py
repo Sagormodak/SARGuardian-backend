@@ -21,17 +21,8 @@ class Settings:
         "SCIENCE_EXPECTED_COMMIT", "77cc9646cfa46d3aff3669d351912f984cf67aa3"
     )
     drive_mode: str = os.getenv("DRIVE_MODE", "mock").lower()
-    worker_mode: str = os.getenv("WORKER_MODE", "local").lower()
-    github_actions_token: str = os.getenv("GITHUB_ACTIONS_TOKEN", "")
-    github_actions_repository: str = os.getenv(
-        "GITHUB_ACTIONS_REPOSITORY",
-        "Sagormodak/SARGuardian-backend",
-    )
-    github_actions_workflow: str = os.getenv(
-        "GITHUB_ACTIONS_WORKFLOW",
-        "sarguardian-science-worker.yml",
-    )
     worker_callback_secret: str = os.getenv("WORKER_CALLBACK_SECRET", "")
+    github_workflow_ref: str = os.getenv("GITHUB_WORKFLOW_REF", "feat/real-goff-worker-14gb")
 
 
 settings = Settings()

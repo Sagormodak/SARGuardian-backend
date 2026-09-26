@@ -4,144 +4,300 @@ on:
   workflow_dispatch:
     inputs:
       job_id:
-        description: "SARGuardian job ID"
+        description: "Job ID"
         required: true
         type: string
-      processing_metadata:
-        description: "Sanitized job processing metadata as JSON"
-        required: true
+      benchmark_only:
+        description: "Run benchmark mode (single product)"
+        required: false
+        default: false
+        type: boolean
+      target_lat:
+        description: "Optional compatibility target latitude; user AOI centroid is used when empty"
+        required: false
+        default: ""
         type: string
-
-permissions:
-  contents: read
+      target_lon:
+        description: "Optional compatibility target longitude; user AOI centroid is used when empty"
+        required: false
+        default: ""
+        type: string
+      start_date:
+        description: "Temporal start date (YYYY-MM-DD)"
+        required: false
+        default: "2025-11-25"
+        type: string
+      end_date:
+        description: "Temporal end date (YYYY-MM-DD); empty means today"
+        required: false
+        default: ""
+        type: string
+      aoi_geojson:
+        description: "User AOI as a GeoJSON Polygon"
+        required: false
+        default: ""
+        type: string
+      regression_mode:
+        description: "Use the documented Langtang stack only for regression validation"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
-  worker-smoke-test:
+  sarguardian-science:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      EARTHDATA_USERNAME: ${{ secrets.EARTHDATA_USERNAME }}
+      EARTHDATA_PASSWORD: ${{ secrets.EARTHDATA_PASSWORD }}
+      GOOGLE_DRIVE_OAUTH_CLIENT_JSON: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_JSON }}
+      GOOGLE_DRIVE_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_REFRESH_TOKEN }}
+      GOOGLE_DRIVE_PARENT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_PARENT_FOLDER_ID }}
+      WORKER_CALLBACK_SECRET: ${{ secrets.WORKER_CALLBACK_SECRET }}
+      RENDER_CALLBACK_URL: ${{ vars.RENDER_CALLBACK_URL }}
 
     steps:
-      - name: Checkout backend
+      - name: Checkout SARGuardian backend
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
-      - name: Validate worker inputs
+      - name: Verify backend revision
+        shell: bash
+        run: git rev-parse HEAD
+
+      - name: Checkout pinned SARGuardian science source
+        uses: actions/checkout@v4
+        with:
+          repository: Sagormodak/SARGuardian
+          ref: 77cc9646cfa46d3aff3669d351912f984cf67aa3
+          path: science-source
+
+      - name: Verify science source revision
+        shell: bash
+        run: |
+          expected="77cc9646cfa46d3aff3669d351912f984cf67aa3"
+          actual="$(git -C science-source rev-parse HEAD)"
+          test "$actual" = "$expected"
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install pinned science requirements and Earthaccess
+        run: |
+          python -m pip install --no-cache-dir --requirement science-source/requirements.txt
+          python -m pip install --no-cache-dir --upgrade earthaccess
+
+      - name: Temporary Earthdata network diagnostics
+        shell: bash
+        run: |
+          echo "EARTHDATA_NETWORK_DIAGNOSTICS_START" || true
+          hostname || true
+          for name in RUNNER_NAME RUNNER_OS RUNNER_ARCH RUNNER_ENVIRONMENT RUNNER_REGION AZURE_REGION AZURE_LOCATION ImageOS ImageVersion GITHUB_RUN_ID GITHUB_RUN_ATTEMPT GITHUB_JOB GITHUB_WORKFLOW GITHUB_REF GITHUB_SHA; do
+            printf 'RUNNER_METADATA: %s=%s\n' "$name" "${!name-<unset>}" || true
+          done
+          echo "RESOLV_CONF_START" || true
+          cat /etc/resolv.conf || true
+          echo "RESOLV_CONF_END" || true
+          getent hosts urs.earthdata.nasa.gov || true
+          getent ahostsv4 urs.earthdata.nasa.gov || true
+          getent ahostsv6 urs.earthdata.nasa.gov || true
+          python -c 'import socket; print(socket.getaddrinfo("urs.earthdata.nasa.gov", 443, type=socket.SOCK_STREAM))' || true
+          for host in github.com pypi.org google.com; do
+            echo "CONTROL_DNS_HOST: $host" || true
+            getent hosts "$host" || true
+            python -c 'import socket, sys; print(socket.getaddrinfo(sys.argv[1], 443, type=socket.SOCK_STREAM))' "$host" || true
+          done
+          curl -4 -I --connect-timeout 10 --max-time 15 https://urs.earthdata.nasa.gov/ || true
+          curl -6 -I --connect-timeout 10 --max-time 15 https://urs.earthdata.nasa.gov/ || true
+          if command -v nslookup >/dev/null 2>&1; then
+            nslookup urs.earthdata.nasa.gov || true
+          else
+            echo "NSLOOKUP_UNAVAILABLE" || true
+          fi
+          if command -v dig >/dev/null 2>&1; then
+            dig urs.earthdata.nasa.gov || true
+            dig @1.1.1.1 urs.earthdata.nasa.gov || true
+            dig @8.8.8.8 urs.earthdata.nasa.gov || true
+          else
+            echo "DIG_UNAVAILABLE" || true
+          fi
+          echo "EARTHDATA_NETWORK_DIAGNOSTICS_COMPLETE" || true
+
+      - name: Run SARGuardian GOFF worker
+        id: worker
         env:
           JOB_ID: ${{ inputs.job_id }}
-          PROCESSING_METADATA: ${{ inputs.processing_metadata }}
+          BENCHMARK_ONLY: ${{ inputs.benchmark_only }}
+          TARGET_LAT: ${{ inputs.target_lat }}
+          TARGET_LON: ${{ inputs.target_lon }}
+          START_DATE: ${{ inputs.start_date }}
+          END_DATE: ${{ inputs.end_date }}
+          AOI_GEOJSON: ${{ inputs.aoi_geojson }}
+          REGRESSION_MODE: ${{ inputs.regression_mode }}
+        shell: bash
         run: |
+          set -euo pipefail
+          PARAMETERS_JSON="$(
           python - <<'PY'
           import json
           import os
-          import re
-          import sys
 
-          job_id = os.environ["JOB_ID"]
-          metadata_raw = os.environ["PROCESSING_METADATA"]
-
-          if not job_id or not re.fullmatch(
-              r"[0-9a-fA-F-]{8,64}",
-              job_id,
-          ):
-              print("WORKER_INPUT_INVALID")
-              sys.exit(1)
-
-          try:
-              metadata = json.loads(metadata_raw)
-          except json.JSONDecodeError:
-              print("WORKER_INPUT_INVALID")
-              sys.exit(1)
-
-          if not isinstance(metadata, dict):
-              print("WORKER_INPUT_INVALID")
-              sys.exit(1)
-
-          print("WORKER_INPUT_VALID")
-          print(f"WORKER_JOB_ID: {job_id}")
-          print("WORKER_METADATA_VALID")
+          parameters = {
+              "start_date": os.environ["START_DATE"],
+              "end_date": os.environ["END_DATE"] or None,
+              "regression_mode": os.environ["REGRESSION_MODE"].lower() == "true",
+          }
+          if os.environ["TARGET_LAT"]:
+              parameters["target_lat"] = os.environ["TARGET_LAT"]
+          if os.environ["TARGET_LON"]:
+              parameters["target_lon"] = os.environ["TARGET_LON"]
+          aoi_geojson = os.environ["AOI_GEOJSON"]
+          if aoi_geojson:
+              parameters["aoi"] = json.loads(aoi_geojson)
+          print(json.dumps(parameters, separators=(",", ":")))
           PY
+          )"
 
-      - name: Notify Render that worker started
+          printf 'WORKER_PARAMETERS_JSON: %s\n' "$PARAMETERS_JSON"
+
+          WORK_OUTPUT_DIR="$(mktemp -d "${RUNNER_TEMP}/sarguardian-${JOB_ID}-XXXXXX")"
+          echo "SARGUARDIAN_WORK_OUTPUT_DIR=$WORK_OUTPUT_DIR" >> "$GITHUB_ENV"
+          worker_args=(
+            --job-id "$JOB_ID"
+            --output-dir "$WORK_OUTPUT_DIR/result"
+            --science-root "$PWD/science-source"
+            --parameters "$PARAMETERS_JSON"
+          )
+
+          if [ "$BENCHMARK_ONLY" = "true" ]; then
+            worker_args+=(--benchmark-only)
+          fi
+
+          python scripts/sarguardian_worker.py "${worker_args[@]}"
+          pwd
+          ls -lah "$WORK_OUTPUT_DIR/result/"
+          test -f "$WORK_OUTPUT_DIR/result/result.json"
+          test -f "$WORK_OUTPUT_DIR/result/timeseries.csv"
+          test -f "$WORK_OUTPUT_DIR/result/manifest.json"
+
+      - name: Complete worker-generated result package
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${SARGUARDIAN_WORK_OUTPUT_DIR:?worker output directory must be set}"
+          result_dir="$SARGUARDIAN_WORK_OUTPUT_DIR/result"
+          ls -lah "$result_dir/"
+          stat "$result_dir/manifest.json"
+          file "$result_dir/manifest.json"
+          test -f "$result_dir/manifest.json"
+          cat > "$result_dir/README.txt" <<'EOF'
+          SARGuardian GOFF time-series result
+
+          This package contains the compact result of sequential GOFF processing.
+          Science commit: 77cc9646cfa46d3aff3669d351912f984cf67aa3
+          Job ID: ${{ inputs.job_id }}
+          Mode: ${{ inputs.benchmark_only && 'benchmark' || 'full' }}
+          Workflow: sequential Earthaccess GOFF downloads, pinned read_goff layer2 processing,
+          source-AOI fixed-lattice common reference, candidate-4 target-window measurement,
+          and existing time-series inversion.
+          result.json contains the compact run summary.
+          timeseries.csv contains cumulative time-series rows.
+          manifest.json records provenance, selections, measurements, inversions, timings, and cleanup status.
+          Raw NISAR HDF5 products are deleted immediately after derived processing and are not included in this package.
+          EOF
+          test -f "$result_dir/README.txt"
+          test -f "$result_dir/result.json"
+          test -f "$result_dir/timeseries.csv"
+          test -f "$result_dir/manifest.json"
+
+      - name: Upload GOFF result package to Google Drive
+        if: success()
+        id: drive_upload
         env:
+          GOOGLE_DRIVE_OAUTH_CLIENT_JSON: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_JSON }}
+          GOOGLE_DRIVE_PARENT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_PARENT_FOLDER_ID }}
+          GOOGLE_DRIVE_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_REFRESH_TOKEN }}
           JOB_ID: ${{ inputs.job_id }}
-          WORKER_CALLBACK_SECRET: ${{ secrets.WORKER_CALLBACK_SECRET }}
         run: |
-          python - <<'PY'
-          import json
-          import os
-          from urllib.request import Request, urlopen
+          set -euo pipefail
+          echo "DRIVE_UPLOAD_COMMAND_STARTED"
+          set +e
+          output=$(python scripts/upload_goff_result_to_drive.py --result-directory "$SARGUARDIAN_WORK_OUTPUT_DIR/result")
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          echo "DRIVE_UPLOAD_EXIT_STATUS: $status"
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          folder_id=$(printf '%s\n' "$output" | sed -n 's/^DRIVE_FOLDER_ID: //p' | tail -n 1)
+          file_ids_json=$(printf '%s\n' "$output" | sed -n 's/^DRIVE_FILE_IDS_JSON: //p' | tail -n 1)
+          test -n "$folder_id"
+          printf '%s' "$file_ids_json" | jq -e -c '
+            type == "object"
+            and (keys as $keys | ["README.txt", "manifest.json", "metadata.json", "result.json", "timeseries.csv"] | all(.[]; . as $key | ($keys | index($key) != null)))
+            and all(.[]; type == "string" and length > 0)
+          ' > /dev/null
+          echo "drive_folder_id=$folder_id" >> "$GITHUB_OUTPUT"
+          echo "drive_file_ids=$(printf '%s' "$file_ids_json" | jq -c .)" >> "$GITHUB_OUTPUT"
 
-          job_id = os.environ["JOB_ID"]
-          secret = os.environ["WORKER_CALLBACK_SECRET"]
-
-          url = (
-              "https://sarguardian-backend.onrender.com"
-              f"/internal/worker/jobs/{job_id}/callback"
-          )
-
-          payload = json.dumps({
-              "status": "processing"
-          }).encode("utf-8")
-
-          request = Request(
-              url,
-              data=payload,
-              headers={
-                  "Authorization": f"Bearer {secret}",
-                  "Content-Type": "application/json",
-                  "User-Agent": "SARGuardian-GitHub-Worker",
-              },
-              method="POST",
-          )
-
-          with urlopen(request, timeout=30) as response:
-              if response.status != 200:
-                  raise RuntimeError("WORKER_CALLBACK_PROCESSING_FAILED")
-
-          print("WORKER_CALLBACK_PROCESSING_OK")
-          PY
-
-      - name: Worker smoke test
+      - name: Remove temporary user science outputs
+        if: always()
+        shell: bash
         run: |
-          echo "SARGuardian worker dispatch reached GitHub Actions successfully."
-          echo "SCIENCE_EXECUTION_NOT_STARTED"
+          set -euo pipefail
+          : "${SARGUARDIAN_WORK_OUTPUT_DIR:?worker output directory must be set}"
+          case "$SARGUARDIAN_WORK_OUTPUT_DIR" in
+            "$RUNNER_TEMP"/sarguardian-*) rm -rf -- "$SARGUARDIAN_WORK_OUTPUT_DIR" ;;
+            *) echo "Unexpected temporary output path" >&2; exit 1 ;;
+          esac
 
-      - name: Mark smoke test complete
-        env:
-          JOB_ID: ${{ inputs.job_id }}
-          WORKER_CALLBACK_SECRET: ${{ secrets.WORKER_CALLBACK_SECRET }}
+      - name: Callback Render with completion
+        if: always()
+        shell: bash
         run: |
-          python - <<'PY'
-          import json
-          import os
-          from urllib.request import Request, urlopen
-
-          job_id = os.environ["JOB_ID"]
-          secret = os.environ["WORKER_CALLBACK_SECRET"]
-
-          url = (
-              "https://sarguardian-backend.onrender.com"
-              f"/internal/worker/jobs/{job_id}/callback"
-          )
-
-          payload = json.dumps({
-              "status": "failed",
-              "error_code": "WORKER_SMOKE_TEST",
-              "error_message_safe": "Worker smoke test completed; real science was not started",
-          }).encode("utf-8")
-
-          request = Request(
-              url,
-              data=payload,
-              headers={
-                  "Authorization": f"Bearer {secret}",
-                  "Content-Type": "application/json",
-                  "User-Agent": "SARGuardian-GitHub-Worker",
-              },
-              method="POST",
-          )
-
-          with urlopen(request, timeout=30) as response:
-              if response.status != 200:
-                  raise RuntimeError("WORKER_CALLBACK_FAILED")
-
-          print("WORKER_CALLBACK_TERMINAL_OK")
-          PY
+          set -euo pipefail
+          if [ -n "${RENDER_CALLBACK_URL}" ] && [ -n "${WORKER_CALLBACK_SECRET}" ]; then
+            CALLBACK_ENDPOINT="${RENDER_CALLBACK_URL%/}/worker/callback/${{ inputs.job_id }}"
+            STATUS="completed"
+            if [ "${{ job.status }}" != "success" ]; then
+              STATUS="failed"
+            fi
+            if [ "$STATUS" = "completed" ]; then
+              SCIENCE_COMMIT="$(git -C science-source rev-parse HEAD)"
+              PAYLOAD=$(jq -cn \
+                --arg job_id "${{ inputs.job_id }}" \
+                --arg run_id "${{ github.run_id }}" \
+                --arg result_folder_id "${{ steps.drive_upload.outputs.drive_folder_id }}" \
+                --argjson result_file_ids '${{ steps.drive_upload.outputs.drive_file_ids }}' \
+                --arg science_commit "$SCIENCE_COMMIT" \
+                '{job_id: $job_id, status: "completed", run_id: $run_id, result_folder_id: $result_folder_id, result_file_ids: $result_file_ids, science_commit: $science_commit}')
+            else
+              PAYLOAD=$(jq -cn \
+                --arg job_id "${{ inputs.job_id }}" \
+                --arg run_id "${{ github.run_id }}" \
+                --arg error_code "GITHUB_ACTIONS_WORKER_FAILED" \
+                --arg error_message_safe "GitHub Actions science worker failed" \
+                '{job_id: $job_id, status: "failed", run_id: $run_id, error_code: $error_code, error_message_safe: $error_message_safe}')
+            fi
+            RESPONSE=$(curl --silent --show-error --fail-with-body --retry 3 --retry-delay 5 \
+              -X POST "$CALLBACK_ENDPOINT" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${WORKER_CALLBACK_SECRET}" \
+              -d "$PAYLOAD" \
+              --max-time 30)
+            printf '%s' "$RESPONSE" | jq -e \
+              --arg job_id "${{ inputs.job_id }}" \
+              --arg status "$STATUS" \
+              'type == "object" and .status == "accepted" and .job_id == $job_id and .job_status == $status' \
+              > /dev/null
+            echo "WORKER_CALLBACK_ACCEPTED: status=$STATUS"
+          else
+            echo "Callback not configured, skipping"
+          fi
