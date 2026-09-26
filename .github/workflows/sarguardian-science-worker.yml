@@ -127,6 +127,14 @@ jobs:
         if: success()
         shell: bash
         run: |
+          set -euo pipefail
+          : "${GITHUB_WORKSPACE:?GITHUB_WORKSPACE must be set}"
+          cd "$GITHUB_WORKSPACE"
+          pwd
+          ls -lah .
+          ls -lah result/
+          stat result/manifest.json
+          file result/manifest.json
           test -f result/manifest.json
           cat > result/README.txt <<'EOF'
           SARGuardian GOFF time-series result

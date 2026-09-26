@@ -115,13 +115,17 @@ def test_worker_workflow_checks_the_dispatch_revision_and_result_files():
     assert "run: git rev-parse HEAD" in workflow
     for command in (
         "pwd",
+        "ls -lah .",
         "ls -lah result/",
+        "stat result/manifest.json",
+        "file result/manifest.json",
         "test -f result/result.json",
         "test -f result/timeseries.csv",
         "test -f result/manifest.json",
         "test -f result/README.txt",
     ):
         assert command in workflow
+    assert 'cd "$GITHUB_WORKSPACE"' in workflow
 
 
 def test_worker_writes_a_detailed_manifest_in_benchmark_and_full_modes():
