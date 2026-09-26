@@ -21,6 +21,7 @@ class Settings:
         "SCIENCE_EXPECTED_COMMIT", "77cc9646cfa46d3aff3669d351912f984cf67aa3"
     )
     drive_mode: str = os.getenv("DRIVE_MODE", "mock").lower()
+    worker_callback_secret: str = os.getenv("WORKER_CALLBACK_SECRET", "")
 
 
 settings = Settings()

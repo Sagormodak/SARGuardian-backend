@@ -1,0 +1,167 @@
+name: SARGuardian Science Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Job ID"
+        required: true
+        type: string
+      benchmark_only:
+        description: "Run benchmark mode (single product)"
+        required: false
+        default: false
+        type: boolean
+      target_lat:
+        description: "Target latitude"
+        required: false
+        default: "28.27799"
+        type: string
+      target_lon:
+        description: "Target longitude"
+        required: false
+        default: "85.52983"
+        type: string
+      start_date:
+        description: "Temporal start date (YYYY-MM-DD)"
+        required: false
+        default: "2025-11-25"
+        type: string
+
+jobs:
+  sarguardian-science:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      EARTHDATA_USERNAME: ${{ secrets.EARTHDATA_USERNAME }}
+      EARTHDATA_PASSWORD: ${{ secrets.EARTHDATA_PASSWORD }}
+      GOOGLE_DRIVE_OAUTH_CLIENT_JSON: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_JSON }}
+      GOOGLE_DRIVE_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_REFRESH_TOKEN }}
+      GOOGLE_DRIVE_PARENT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_PARENT_FOLDER_ID }}
+      WORKER_CALLBACK_SECRET: ${{ secrets.WORKER_CALLBACK_SECRET }}
+      RENDER_CALLBACK_URL: ${{ vars.RENDER_CALLBACK_URL }}
+
+    steps:
+      - name: Checkout SARGuardian backend
+        uses: actions/checkout@v4
+
+      - name: Checkout pinned SARGuardian science source
+        uses: actions/checkout@v4
+        with:
+          repository: Sagormodak/SARGuardian
+          ref: 77cc9646cfa46d3aff3669d351912f984cf67aa3
+          path: science-source
+
+      - name: Verify science source revision
+        shell: bash
+        run: |
+          expected="77cc9646cfa46d3aff3669d351912f984cf67aa3"
+          actual="$(git -C science-source rev-parse HEAD)"
+          test "$actual" = "$expected"
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install pinned science requirements and Earthaccess
+        run: |
+          python -m pip install --no-cache-dir --requirement science-source/requirements.txt
+          python -m pip install --no-cache-dir --upgrade earthaccess
+
+      - name: Run SARGuardian GOFF worker
+        id: worker
+        env:
+          BENCHMARK_ONLY: ${{ inputs.benchmark_only }}
+          TARGET_LAT: ${{ inputs.target_lat }}
+          TARGET_LON: ${{ inputs.target_lon }}
+          START_DATE: ${{ inputs.start_date }}
+        run: |
+          SCIENCE_ROOT="$PWD/science-source" \
+          OUTPUT_DIR="$PWD/result" \
+          JOB_ID="${{ inputs.job_id }}" \
+          BENCHMARK_ONLY="${{ inputs.benchmark_only }}" \
+          PARAMETERS_JSON="{\"target_lat\":${{ inputs.target_lat }},\"target_lon\":${{ inputs.target_lon }},\"start_date\":\"${{ inputs.start_date }}\"}" \
+          python scripts/sarguardian_worker.py \
+            --job-id "${{ inputs.job_id }}" \
+            --output-dir "$PWD/result" \
+            --science-root "$PWD/science-source" \
+            ${{ inputs.benchmark_only && '--benchmark-only' || '' }} \
+            --parameters "$PARAMETERS_JSON"
+
+      - name: Create result package manifest
+        if: success()
+        shell: bash
+        run: |
+          cp result/result.json result/manifest.json
+          cat > result/README.txt <<'EOF'
+          SARGuardian GOFF time-series result
+
+          This package contains the compact result of sequential GOFF processing.
+          Science commit: 77cc9646cfa46d3aff3669d351912f984cf67aa3
+          Job ID: ${{ inputs.job_id }}
+          Mode: ${{ inputs.benchmark_only && 'benchmark' || 'full' }}
+          Workflow: sequential Earthaccess GOFF downloads, pinned read_goff layer2 processing,
+          source-AOI fixed-lattice common reference, candidate-4 target-window measurement,
+          and existing time-series inversion.
+          result.json contains the compact run summary.
+          timeseries.csv contains cumulative time-series rows.
+          manifest.json records provenance, selections, measurements, inversions, timings, and cleanup status.
+          Raw NISAR HDF5 products are deleted immediately after derived processing and are not included in this package.
+          EOF
+
+      - name: Upload GOFF result package to Google Drive
+        if: success()
+        id: drive_upload
+        env:
+          GOOGLE_DRIVE_OAUTH_CLIENT_JSON: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_JSON }}
+          GOOGLE_DRIVE_PARENT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_PARENT_FOLDER_ID }}
+          GOOGLE_DRIVE_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_REFRESH_TOKEN }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          output=$(python scripts/upload_goff_result_to_drive.py)
+          echo "$output"
+          folder_id=$(echo "$output" | grep "^DRIVE_FOLDER_ID:" | cut -d' ' -f2)
+          if [ -n "$folder_id" ]; then
+            echo "drive_folder_id=$folder_id" >> "$GITHUB_OUTPUT"
+          fi
+          file_ids_json=$(echo "$output" | grep "^DRIVE_FILE_ID:" | sed 's/^DRIVE_FILE_ID: //' | jq -R . | jq -s 'split("\n") | map(select(length > 0)) | from_entries')
+          if [ -n "$file_ids_json" ] && [ "$file_ids_json" != "{}" ]; then
+            echo "drive_file_ids=$file_ids_json" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Callback Render with completion
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${RENDER_CALLBACK_URL}" ] && [ -n "${WORKER_CALLBACK_SECRET}" ]; then
+            STATUS="completed"
+            if [ "${{ job.status }}" != "success" ]; then
+              STATUS="failed"
+            fi
+            PAYLOAD="{\"job_id\": \"${{ inputs.job_id }}\", \"status\": \"$STATUS\", \"run_id\": \"${{ github.run_id }}\""
+            if [ "$STATUS" = "completed" ] && [ -n "${{ steps.drive_upload.outputs.drive_folder_id }}" ]; then
+              PAYLOAD="$PAYLOAD, \"result_folder_id\": \"${{ steps.drive_upload.outputs.drive_folder_id }}\""
+            fi
+            if [ "$STATUS" = "completed" ] && [ -n "${{ steps.drive_upload.outputs.drive_file_ids }}" ]; then
+              PAYLOAD="$PAYLOAD, \"result_file_ids\": ${{ steps.drive_upload.outputs.drive_file_ids }}"
+            fi
+            PAYLOAD="$PAYLOAD}"
+            curl -X POST "${RENDER_CALLBACK_URL}/jobs/${{ inputs.job_id }}/callback" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${WORKER_CALLBACK_SECRET}" \
+              -d "$PAYLOAD" \
+              --max-time 30 --retry 3 --retry-delay 5 || echo "Callback failed but continuing"
+          else
+            echo "Callback not configured, skipping"
+          fi
+
+      - name: Upload result package as artifact (fallback)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarguardian-goff-result-${{ github.run_id }}
+          path: result/
+          if-no-files-found: error

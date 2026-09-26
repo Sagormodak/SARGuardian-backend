@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from app.db import SessionLocal
 from app.models import Job, JobStatus
-from app.science.service import ScienceExecutionError, ScienceService, build_science_service
+from app.science.service import ScienceExecutionError, ScienceResult, ScienceService, build_science_service
 from app.storage.drive_service import DriveServiceError, DriveService, build_drive_service
 
 executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sarguardian-job")
@@ -37,16 +37,24 @@ def process_job(job_id: str) -> None:
         parameters = json.loads(job.processing_metadata_json)
         service = science_service_override or build_science_service()
         result = service.run(job.job_id, parameters)
-        drive_service = drive_service_override or build_drive_service()
-        drive_result = drive_service.upload_result_package(job.job_id, result.package)
-        metadata = {**parameters, **result.metadata}
-        job.processing_metadata_json = json.dumps(metadata)
-        job.result_folder_id = drive_result.folder_id
-        job.result_file_ids_json = json.dumps(drive_result.file_ids)
-        job.status = JobStatus.COMPLETED
-        job.completed_at = datetime.now(timezone.utc)
-        job.error_code = None
-        job.error_message_safe = None
+
+        if result.metadata.get("dispatched"):
+            metadata = {**parameters, **result.metadata}
+            job.processing_metadata_json = json.dumps(metadata)
+            job.completed_at = None
+            job.error_code = None
+            job.error_message_safe = None
+        else:
+            drive_service = drive_service_override or build_drive_service()
+            drive_result = drive_service.upload_result_package(job.job_id, result.package)
+            metadata = {**parameters, **result.metadata}
+            job.processing_metadata_json = json.dumps(metadata)
+            job.result_folder_id = drive_result.folder_id
+            job.result_file_ids_json = json.dumps(drive_result.file_ids)
+            job.status = JobStatus.COMPLETED
+            job.completed_at = datetime.now(timezone.utc)
+            job.error_code = None
+            job.error_message_safe = None
     except ScienceExecutionError as exc:
         job.status = JobStatus.FAILED
         job.error_code = exc.code
