@@ -16,6 +16,6 @@ services:
       - key: DRIVE_MODE
         value: real
       - key: GITHUB_WORKFLOW_REF
-        value: feat/real-goff-worker-14gb
+        value: main
       - key: WORKER_CALLBACK_SECRET
         sync: false
